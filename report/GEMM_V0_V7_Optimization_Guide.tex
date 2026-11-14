@@ -1,0 +1,1246 @@
+\documentclass[UTF8,11pt,a4paper,fontset=fandol]{ctexart}
+\usepackage[a4paper,margin=2.05cm,headheight=15pt]{geometry}
+\usepackage[table]{xcolor}
+\usepackage{amsmath,amssymb,booktabs,tabularx,array,longtable}
+\usepackage{graphicx,float,tikz,listings,hyperref,fancyhdr,enumitem}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds}
+\definecolor{Blue}{HTML}{245A8D}
+\definecolor{Green}{HTML}{447B24}
+\definecolor{Orange}{HTML}{C77A21}
+\definecolor{PaleBlue}{HTML}{EAF2FA}
+\definecolor{PaleGreen}{HTML}{EDF5E8}
+\definecolor{PaleOrange}{HTML}{FFF3E4}
+\definecolor{Ink}{HTML}{263342}
+\definecolor{CodeBg}{HTML}{F5F7FA}
+\hypersetup{colorlinks=true,linkcolor=Blue,urlcolor=Blue,citecolor=Green,bookmarksdepth=2,
+  pdftitle={从 V0 到 V7：CUDA GEMM 优化详解},pdfauthor={gemm-opt 项目}}
+\pagestyle{fancy}\fancyhf{}
+\lhead{\small CUDA GEMM：V0--V7 源码与数据流}
+\rhead{\small gemm-opt}\cfoot{\thepage}
+\setlength{\parskip}{0.3em}
+\setlength{\emergencystretch}{3em}
+\setlist{itemsep=0.2em,topsep=0.3em}
+\renewcommand{\arraystretch}{1.22}
+\setcounter{tocdepth}{1}
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\src}[2]{\noindent{\small\color{Blue}源码：\code{#1}，第 #2 行。}\par}
+\newcommand{\takeaway}[1]{\par\noindent\colorbox{PaleBlue}{\parbox{\dimexpr\linewidth-2\fboxsep\relax}{\textbf{本页要点}\quad #1}}\par}
+\newcommand{\caution}[1]{\par\noindent\colorbox{PaleOrange}{\parbox{\dimexpr\linewidth-2\fboxsep\relax}{\textbf{注意}\quad #1}}\par}
+\newcommand{\pagebreakhere}{\clearpage}
+\lstdefinestyle{cuda}{language=C++,basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{Blue}\bfseries,commentstyle=\color{Green},
+  stringstyle=\color{Orange},backgroundcolor=\color{CodeBg},frame=single,
+  rulecolor=\color{gray!25},numbers=left,numberstyle=\tiny\color{gray},
+  numbersep=7pt,breaklines=true,columns=fullflexible,showstringspaces=false,
+  tabsize=4,aboveskip=0.6em,belowskip=0.6em}
+\lstset{style=cuda}
+\tikzset{box/.style={draw=Blue,thick,rounded corners=2mm,fill=PaleBlue,
+  align=center,minimum height=1cm,font=\small},
+  calcbox/.style={box,draw=Green,fill=PaleGreen},
+  warnbox/.style={box,draw=Orange,fill=PaleOrange},
+  arrow/.style={-{Latex[length=2.5mm]},thick,draw=Ink},
+  thinarr/.style={-{Latex[length=2mm]},draw=Blue},
+  lbl/.style={font=\small,align=center}}
+\input{report/figures/Shared_Read_Grid.tex}
+
+\begin{document}
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+\centering
+\vspace*{1.1cm}
+{\large\color{Blue}gemm-opt · CUDA 源码学习手册\par}
+\vspace{0.9cm}
+{\Huge\bfseries 从 V0 到 V7\par}
+\vspace{0.4cm}
+{\huge\bfseries 矩阵乘法优化详解\par}
+\vspace{0.7cm}
+{\Large 从一个线程算一个数，到 Warp 协作使用 Tensor Core\par}
+\vspace{1.6cm}
+\begin{tikzpicture}[node distance=7mm]
+\node[box,minimum width=12cm] (a) {V0 Naive\quad $\longrightarrow$\quad V1 Shared Memory\quad $\longrightarrow$\quad V2 Register Tiling};
+\node[box,below=of a,minimum width=12cm] (b) {V3 float4 加载\quad $\longrightarrow$\quad V4 双缓冲\quad $\longrightarrow$\quad V5 cp.async};
+\node[calcbox,below=of b,minimum width=12cm] (c) {V6 Warp Tiling\quad /\quad V7 WMMA Tensor Core};
+\draw[arrow] (a)--(b);\draw[arrow] (b)--(c);
+\end{tikzpicture}\par
+\vspace{0.85cm}
+\begin{minipage}{0.85\linewidth}
+\large
+\textbf{讲解依据：}项目当前 \code{versions/} 下八个独立版本。\\[0.4em]
+\textbf{阅读重点：}分块形状、线程坐标、访存映射、寄存器外积、\\
+双缓冲时序、异步拷贝同步、Warp 分工、WMMA 与精度变化。
+\end{minipage}
+\vfill
+{\large 2026 年 9 月 14 日\par}
+\vspace{0.4cm}
+{\small 本文是源码讲解，不是新一轮性能测试报告。版本编号不代表性能排名。\par}
+\end{titlepage}
+\hypersetup{pageanchor=true}
+\pagenumbering{roman}
+
+\section*{阅读说明}
+\addcontentsline{toc}{section}{阅读说明}
+这份文档回答的不是“GEMM 一般可以怎样优化”，而是“\textbf{本项目 V0 到 V7 的代码具体怎样工作}”。每个版本都按照目标、分工、加载、计算、同步和代价来说明，代码节选保留原文件行号，便于打开源码对应阅读。
+
+建议先理解三个层级：\textbf{Block tile 是整个线程块负责的 C 区域；Thread tile 是单线程保留的累加结果；BK 是一次搬入共享内存的 K 段长度。}V6 增加 Warp tile，V7 再增加 WMMA fragment。
+
+\begin{itemize}
+\item \textbf{初次学习：}先读第 1--3 节，再读 V2 的外积图、V5 的流水线图和 V7 的分块图。
+\item \textbf{结合代码学习：}按每节标注的源码路径及行号定位。浅蓝框是结论，浅橙框是容易误解的地方。
+\item \textbf{准备讲项目：}最后的对比表和“从优化到验证”给出总结与验证方法。
+\end{itemize}
+
+\caution{V0--V5 大体沿着同一 FP32 路线推进；\textbf{V6 没有保留 V5 的 cp.async 或双缓冲，V7 也没有。}它们分别引入 Warp 分工和 Tensor Core，是研究不同优化方向的实现，而非把所有前面的技术逐项叠加。}
+
+文中的共享内存容量、每线程工作量和逻辑访存次数均由源码推导。没有重新运行八个版本的计时，因此不编造速度曲线、寄存器计数或 Occupancy。项目已有 Auto-Tuning/NCU 报告分析的是另外的参数化实现，其成绩不能直接当作这里 V6 或 V7 的成绩。
+
+\vspace{0.6cm}
+\noindent\textbf{文档与源码}\par
+\noindent\begin{tabularx}{\linewidth}{lX}
+\toprule
+目录/文件 & 在本说明中的用途\\\midrule
+\code{versions/v0_*.cu} 至 \code{v7_*.cu} & 各版本真实 kernel 和 launch 配置\\
+\code{include/gemm_benchmark.cuh} & 输入生成、类型转换、GPU 参考、预热、计时与校验\\
+\code{Makefile} & 八个独立可执行文件的构建方式\\
+\code{autotune/autotune_gemm.cu} & 后续参数搜索；不是这里八个版本的共同 benchmark\\
+\code{report/} & 本手册及原有性能分析报告\\\bottomrule
+\end{tabularx}
+\pagebreakhere
+\tableofcontents
+\pagebreakhere
+\pagenumbering{arabic}
+
+\section{先建立坐标系：矩阵、K 方向与 GPU 层级}
+\subsection{我们究竟要计算什么}
+所有版本的数学目标是 $C=AB$，没有额外的 $\alpha$、$\beta$ 或输入 C：
+\[
+A\in\mathbb{R}^{M\times K},\qquad B\in\mathbb{R}^{K\times N},\qquad
+C\in\mathbb{R}^{M\times N},\qquad
+C_{r,c}=\sum_{q=0}^{K-1} A_{r,q}B_{q,c}.
+\]
+\textbf{M 决定输出行数；N 决定输出列数；K 是每个输出元素的点积长度。}“K 方向”就是 A 的列方向、B 的行方向；沿它推进时，C 的坐标不变，只不断累加新的乘积。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.75cm,y=0.75cm]
+\draw[fill=PaleBlue,draw=Blue] (0,0) rectangle (4,3);
+\fill[Orange!35] (0,1.35) rectangle (4,1.65);
+\draw[arrow] (0.5,1.5)--(3.6,1.5);
+\node[lbl] at (2,3.4) {$A: M\times K$};
+\node[lbl] at (2,-0.5) {固定一行，沿 K 读};
+\draw[fill=PaleBlue,draw=Blue] (5.5,0) rectangle (9.5,3);
+\fill[Orange!35] (7.35,0) rectangle (7.65,3);
+\draw[arrow] (7.5,2.7)--(7.5,0.3);
+\node[lbl] at (7.5,3.4) {$B: K\times N$};
+\node[lbl] at (7.5,-0.5) {固定一列，沿 K 读};
+\draw[fill=PaleGreen,draw=Green] (11,0) rectangle (14.5,3);
+\fill[Orange] (12.6,1.4) rectangle (12.9,1.7);
+\node[lbl] at (12.75,3.4) {$C: M\times N$};
+\node[lbl] at (12.75,-0.5) {累加到同一个 $C_{r,c}$};
+\node at (4.75,1.5) {$\times$};\node at (10.25,1.5) {$=$};
+\end{tikzpicture}
+\caption{K 是归约方向，不是输出矩阵的另一个坐标。}
+\end{figure}
+
+\subsection{二维矩阵为什么用一维 vector / 指针}
+本项目使用\textbf{行主序}：一行接一行存储。二维访问转换为一维下标：
+\[
+A[r,q]\leftrightarrow A[rK+q],\quad
+B[q,c]\leftrightarrow B[qN+c],\quad
+C[r,c]\leftrightarrow C[rN+c].
+\]
+例如 $3\times4$ 矩阵的第 2 行、第 3 列（从 0 开始）位于 $2\times4+3=11$。\code{matrix + offset} 是指向该元素的指针，并不是取出元素值；\code{*} 才是解引用。
+
+\code{static_cast<size_t>(row) * cols} 先将行号转换成用于大小/地址计算的类型，再乘行宽；这有助于避免在 int 中先乘出溢出结果。主机 \code{std::vector} 与 GPU \code{cudaMalloc} 得到的指针属于不同存储位置，必须显式复制。
+\takeaway{固定输出行列，沿 K 方向累加。BK 只是把这个长度为 K 的点积拆成若干段；没有改变矩阵乘法本身。}
+\pagebreakhere
+
+\subsection{Grid、Block、Warp、Thread 的分工}
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm]
+\node[box,minimum width=12cm] (g) {Grid：覆盖整个 $M\times N$ 输出矩阵};
+\node[box,below=of g,minimum width=12cm] (b) {Block：协作计算 $BM\times BN$ 的输出 tile，共享片上 Shared Memory};
+\node[calcbox,below=of b,minimum width=12cm] (w) {Warp：32 个线程；V6、V7 显式分配 $32\times32$ 输出区域};
+\node[calcbox,below=of w,minimum width=12cm] (t) {Thread：私有 Registers，保存输入片段和累加结果};
+\draw[arrow] (g)--(b);\draw[arrow] (b)--(w);\draw[arrow] (w)--(t);
+\end{tikzpicture}
+\caption{这是任务划分层级，不代表 warp 和 block 一定各占一个独立物理核心。}
+\end{figure}
+
+\noindent\begin{tabularx}{\linewidth}{lX}
+\toprule
+符号 & 本文中的确切含义\\\midrule
+$BM,BN$ & 一个 Block 负责的输出行数、列数\\
+$BK$ & 一轮加载的 K 长度；共享内存中 A 是 $BM\times BK$，B 是 $BK\times BN$\\
+$TM,TN$ & V2--V6 单线程累加的输出个数，分别沿 M、N 方向计数\\
+$WM,WN$ & V6/V7 单个 Warp 负责的输出行数、列数\\
+tileK & 当前 K 段的全局起点，如 $0,16,32,\ldots$\\
+k & 当前 K 段内部的下标，如 $0,1,\ldots,15$\\
+$q=\mathrm{tileK}+k$ & 在 A/B 原始矩阵中的实际 K 坐标\\\bottomrule
+\end{tabularx}
+
+\subsection{三种关键存储的位置}
+\textbf{Global Memory：}GPU 的全局地址空间，A、B、C 在这里。实际请求可能命中缓存，不应把每次源码读取都算成一次 DRAM 读取。
+
+\textbf{Shared Memory：}线程块内共享的片上存储，用来暂存 A/B tile。线程之间协作写入、交叉读取，因此需要正确的同步。
+
+\textbf{Registers：}线程私有的高速存储，用来保留 \code{accum}、\code{regA}、\code{regB}。源代码的小数组通常有机会被编译器拆到寄存器，但真实寄存器数和 spill 要看编译结果，不能简单数 C++ 变量。
+
+\textbf{\texttt{\#pragma unroll}：}告诉编译器尝试把固定次数循环展开，减少循环控制并暴露常量下标与独立指令；它不是创建更多线程，也不是异步执行。\code{accum[i][j] += a*b} 则表达一次乘加，是否生成融合 FMA 及其具体指令形式，要看编译选项和机器码。
+
+\caution{\code{dim3 block(16,16)} 的 16×16 是\textbf{线程坐标}，不是说每个版本只能计算 16×16 个输出。V2--V5 的 256 个线程，每线程计算 16 个输出，所以 Block 输出 tile 是 64×64。}
+\pagebreakhere
+
+\section{V0--V7 总览：哪些部分发生了变化}
+\begin{table}[H]\centering\small
+\begin{tabular}{llrrrrl}
+\toprule
+版本 & Block 输出/K 段 & 线程 & Warp & 输出/线程 & Shared & 输入/累加\\\midrule
+V0 & $16\times16$/逐 k & 256 & 8 & 1 & 0 & FP32/FP32\\
+V1 & $16\times16$/$16$ & 256 & 8 & 1 & 2 KiB & FP32/FP32\\
+V2 & $64\times64$/$16$ & 256 & 8 & 16 & 8.25 KiB & FP32/FP32\\
+V3 & $64\times64$/$16$ & 256 & 8 & 16 & 8.25 KiB & FP32/FP32\\
+V4 & $64\times64$/$16$ & 256 & 8 & 16 & 16.5 KiB & FP32/FP32\\
+V5 & $64\times64$/$16$ & 256 & 8 & 16 & 16 KiB & FP32/FP32\\
+V6 & $64\times64$/$16$ & 128 & 4 & 32 & 8.25 KiB & FP32/FP32\\
+V7 & $64\times64$/$16$ & 128 & 4 & Warp 分布 & 20 KiB & FP16/FP32\\\bottomrule
+\end{tabular}
+\caption{Shared 为源码声明的每 Block 静态容量，不含编译器/硬件分配粒度。V7 的 fragment 元素归属由 WMMA 定义，不能按 V6 的坐标理解。}
+\end{table}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=6mm and 7mm]
+\node[box,minimum width=3.8cm] (v0) {V0：直接点积};
+\node[box,right=of v0,minimum width=3.8cm] (v1) {V1：Block 级复用};
+\node[box,right=of v1,minimum width=3.8cm] (v2) {V2：Thread 级复用};
+\node[box,below=of v2,minimum width=3.8cm] (v3) {V3：float4 搬运};
+\node[box,left=of v3,minimum width=3.8cm] (v4) {V4：寄存器预取\,+ 双缓冲};
+\node[box,left=of v4,minimum width=3.8cm] (v5) {V5：cp.async 双缓冲};
+\node[calcbox,below=12mm of v3,minimum width=3.8cm] (v6) {V6：Warp 分工\\单缓冲、普通 float4};
+\node[calcbox,left=of v6,minimum width=3.8cm] (v7) {V7：WMMA\\单缓冲、FP16 标量加载};
+\draw[arrow] (v0)--(v1);\draw[arrow] (v1)--(v2);\draw[arrow] (v2)--(v3);
+\draw[arrow] (v3)--(v4);\draw[arrow] (v4)--(v5);
+\draw[arrow,dashed] (v3)--node[right,font=\scriptsize]{改变计算分工}(v6);
+\draw[arrow,dashed] (v6.south)--++(0,-0.45)-|(v7.south);
+\node[lbl,font=\scriptsize] at ($(v6.south)!0.5!(v7.south)+(0,-0.8)$) {改变计算硬件/精度};
+\end{tikzpicture}
+\caption{实线强调加载路径逐步改进，虚线强调另一优化方向；不是所有版本都继承上一编号的全部技术。}
+\end{figure}
+
+\textbf{容量怎么得到？}例如 V2：$[64(16+1)+16\times64]\times4=8448$ 字节；V4 两份得到 16896 字节；V5 为保证 16 字节拷贝对齐，A 不补列，两份得到 16384 字节。V7 的 half A/B 各 2048 字节，再加 16384 字节的 FP32 \code{outputTile}，总计 20480 字节。
+
+\takeaway{优化可以针对“复用率、搬运指令、等待时序、线程映射、计算单元”不同环节。它们有资源代价，不能只根据版本号判断快慢。}
+\pagebreakhere
+
+\section{V0：Naive GEMM——一个线程算一个输出}
+\subsection{坐标与点积代码}
+\src{versions/v0_naive.cu}{11--25}
+\lstinputlisting[firstline=11,lastline=25,firstnumber=11]{versions/v0_naive.cu}
+\textbf{第 11--12 行：}用 Block 的起点加线程偏移，得到 C 的列和行。\code{blockIdx.x} 管列，\code{blockIdx.y} 管行。\textbf{第 14--16 行：}网格向上取整，多出来的线程直接返回；本 kernel 没有 Block barrier，这样做没有跳过协作同步的问题。
+
+\textbf{第 18--23 行：}每个线程自己遍历全部 K，读取一行 A 和一列 B。\textbf{第 25 行：}最后写一次 C。累加器在整个 K 循环期间保留在该线程中。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.65cm,y=0.65cm]
+\draw[step=0.45,gray!35] (0,0) grid (7.2,7.2);
+\draw[Blue,thick] (0,0) rectangle (7.2,7.2);
+\fill[Orange!60] (1.35,5.85) rectangle (1.8,6.3);
+\node[lbl] at (3.6,7.7) {一个 Block 的 16×16 输出};
+\node[calcbox,text width=5cm] (n) at (12,4.5) {线程 $(x,y)=(3,2)$\\负责局部 $C[2,3]$\\沿 K 做全部乘加};
+\draw[arrow] (1.8,6.07)--(n.west);
+\node[lbl] at (3.6,-0.5) {每个小格由一个线程负责};
+\end{tikzpicture}
+\caption{线程坐标先映射到输出坐标，再对该输出做完整点积。图中行号由上向下增加。}
+\end{figure}
+
+\subsection{launch 中的向上取整}
+\code{dim3 block(16,16)}；网格是 $\lceil N/16\rceil\times\lceil M/16\rceil$。整数表达式 \code{(N + block.x - 1) / block.x} 实现向上取整。例如 N=1000 时需要 63 个横向 Block，不是 62 个。
+\takeaway{V0 是最容易核对的映射：1 个线程、1 个输出、K 次乘加。后面版本主要改变的是“谁搬数据”和“搬来的数据复用多少次”。}
+\pagebreakhere
+
+\subsection{V0 的瓶颈不能只看“单线程读 B 不连续”}
+对单线程而言，A 的访问 $A[rK+q]$ 连续，B 的访问 $B[qN+c]$ 每次跨一整行。但 GPU 的合并访存还要看\textbf{同一条指令下相邻 lane 的地址}。
+
+一个 16×16 Block 中，线程按 x 优先编号：$tid=16y+x$。第一个 Warp 覆盖 y=0 和 y=1 各 16 个线程。固定 q 时：
+\begin{itemize}
+\item 每组相同 y 的 16 个线程请求同一个 A 元素，有广播/缓存复用机会。
+\item 每组相同 y 的线程读取 16 个相邻的 B 列；两组 y 又请求同一段 B。
+\end{itemize}
+因此，“B 对单线程跨行”\textbf{不等于}“B 对 Warp 一定完全不合并”。V0 的核心问题是没有显式的 Block tile 复用策略，许多输出各自发出重复加载指令，且一个线程只保留一个累加器，独立计算工作较少。
+
+\subsection{用源码逻辑流量做一个基线}
+忽略缓存、广播、编译优化和最终 C 写回，一个输出做 K 次乘加，源码请求 $2K$ 个 float。全矩阵逻辑输入字节数约为
+\[
+Q_{V0,\mathrm{logical}}=2MNK\times4=8MNK.
+\]
+FLOP 按一次乘和一次加计 2 次：$F=2MNK$。由此得到源码逻辑输入强度
+\[
+I_{V0,\mathrm{logical}}=\frac{2MNK}{8MNK}=0.25\ \mathrm{FLOP/B}.
+\]
+这个值适合展示“没有显式 tile 复用”的基线，\textbf{不是硬件实测 DRAM arithmetic intensity}。缓存会改变真正的 DRAM 流量。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=9mm]
+\node[box,text width=3cm] (g) {Global A/B};
+\node[calcbox,right=of g,text width=4cm] (r) {每线程读取一对输入\\更新单个 sum};
+\node[box,right=of r,text width=3cm] (c) {写一个 C 元素};
+\draw[arrow] (g)--(r);\draw[arrow] (r)--(c);
+\draw[arrow] (r.south) -- ++(0,-0.6) -- ++(-2,0) |- (r.west);
+\node[lbl] at (5,-1.35) {重复 K 次};
+\end{tikzpicture}
+\caption{V0 没有共享内存中间层，也没有每线程多输出的外积复用。}
+\end{figure}
+
+\textbf{下一步：}让整个 Block 一起搬一个 A/B 小块，把它在片上共享，再计算许多输出。这就是 V1。
+\pagebreakhere
+
+\section{V1：Shared Memory Tiling——先搬一块，再共同使用}
+\subsection{先分清：一个输出的点积，与一轮输入分块}
+\textbf{计算一个 C 元素，始终是 A 的一行与 B 的一列做点积。}V1 没有把这个规则改成“拿 A 的一列与 B 的一行做点积”。它只是让 256 个线程先共同搬一批数据，再从 Shared 中读取各自所需的行和列。
+\[
+C[r,c]=\sum_{q=0}^{K-1}A[r,q]B[q,c].
+\]
+一个 Block 同时负责 C 的 16 行×16 列，所以需要 A 中\textbf{对应的 16 行}、B 中\textbf{对应的 16 列}。但 K 可能很长，不能每轮都搬全部 K；因此沿 K 拆成长度为 BK=16 的小段。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\draw[Blue,fill=CodeBg] (0,0) rectangle (4,4);
+\fill[Blue!20] (0,2.1) rectangle (4,2.8);
+\fill[Orange!55] (1.4,2.1) rectangle (2.1,2.8);
+\draw[Blue,dashed] (1.4,2.1) rectangle (2.1,2.8);
+\draw[arrow] (0.4,0.6)--(3.6,0.6);
+\node[lbl] at (2,0.95) {沿 K 推进（列方向）};
+\node[lbl] at (2,4.5) {完整 A：$M\times K$};
+\node[lbl] at (2,-0.7) {蓝带：固定 16 行\\橙块：其中的当前 16 列};
+\draw[Blue,fill=CodeBg] (5.3,0) rectangle (9.3,4);
+\fill[Blue!20] (7.3,0) rectangle (8,4);
+\fill[Orange!55] (7.3,2.1) rectangle (8,2.8);
+\draw[Blue,dashed] (7.3,2.1) rectangle (8,2.8);
+\draw[arrow] (5.8,3.6)--(5.8,0.4);
+\node[lbl,rotate=90] at (6.2,2) {沿 K 推进（行方向）};
+\node[lbl] at (7.3,4.5) {完整 B：$K\times N$};
+\node[lbl] at (7.3,-0.7) {蓝带：固定 16 列\\橙块：其中的当前 16 行};
+\draw[Green,fill=PaleGreen] (10.6,0) rectangle (14.6,4);
+\fill[Green!45] (12.6,2.1) rectangle (13.3,2.8);
+\node[lbl] at (12.6,4.5) {完整 C：$M\times N$};
+\node[lbl] at (12.6,-0.7) {绿块：固定的 16×16 输出\\所有 K 段都累加到这里};
+\node at (4.65,2.45) {$\times$};\node at (9.95,2.45) {$\to$};
+\end{tikzpicture}
+\caption{这一图画“从完整矩阵取哪些数据”。橙块均为 16×16，绘图尺寸不按矩阵实际比例。它不表示单个输出的点积读取方向。}
+\end{figure}
+
+设 C Block 的行列起点为 $r_0,c_0$，第 t 轮 K 起点为 $q_0=16t$。这一轮加载的是
+\[
+A[r_0:r_0+16,\ q_0:q_0+16],\qquad
+B[q_0:q_0+16,\ c_0:c_0+16].
+\]
+这里区间采用\textbf{左闭右开}表示，实际下标是起点至起点+15。两个小块相乘为 C tile 增加一段贡献，而不是得到完整的最终 C。
+\takeaway{选输出时：A 选 16 行，B 选 16 列。选本轮 K 段时：A 取当前 16 列，B 取当前 16 行。这两句话说的是不同维度，不矛盾。}
+\pagebreakhere
+
+\subsection{步骤 1--2：确定输出，再让每线程搬一对输入}
+\textbf{用真实参数贯穿本节：}选择 \code{blockIdx.x=2}、\code{blockIdx.y=1}。Block 负责 C 的行 16--31、列 32--47。选择线程 \code{threadIdx.x=3}、\code{threadIdx.y=2}，它负责\textbf{全局输出 $C[18,35]$}，本地输出坐标为 $(y,x)=(2,3)$。
+
+\src{versions/v1_shared_memory.cu}{16--24}
+\lstinputlisting[firstline=16,lastline=24,firstnumber=16]{versions/v1_shared_memory.cu}
+第 16--17 行定位输出；第 18 行把 sum 初始化为 0，位于所有 K 段循环之外。第 20 行向上取整得到轮数；第 23 行 A 的当前列由线程 x 决定，第 24 行 B 的当前行由线程 y 决定。
+
+第 0 轮 t=0，所有线程共同加载 A 的行 16--31/列 0--15，以及 B 的行 0--15/列 32--47：
+\begin{table}[H]\centering\small
+\begin{tabular}{rllll}
+\toprule
+线程 $(x,y)$ & Global A & 写到 Shared A & Global B & 写到 Shared B\\\midrule
+$(0,0)$ & $A[16,0]$ & $tileA[0][0]$ & $B[0,32]$ & $tileB[0][0]$\\
+$(1,0)$ & $A[16,1]$ & $tileA[0][1]$ & $B[0,33]$ & $tileB[0][1]$\\
+$(3,2)$ & $A[18,3]$ & $tileA[2][3]$ & $B[2,35]$ & $tileB[2][3]$\\
+$(15,15)$ & $A[31,15]$ & $tileA[15][15]$ & $B[15,47]$ & $tileB[15][15]$\\\bottomrule
+\end{tabular}
+\caption{加载是一项协作任务；线程搬的这一对值不等于自己输出所需的整行与整列。}
+\end{table}
+
+\src{versions/v1_shared_memory.cu}{26--36}
+\lstinputlisting[firstline=26,lastline=36,firstnumber=26]{versions/v1_shared_memory.cu}
+\textbf{256 线程×每线程 1 个 A，覆盖全部 256 个 A 元素；B 同理。}写好后第一次 \code{__syncthreads()} 保证 Block 汇合，再交叉读取。不是让一个线程自己把整行 A 和整列 B 都从 Global 加载一遍。
+\pagebreakhere
+
+\subsection{步骤 3：从 Shared 取 A 的一行、B 的一列做 16 项点积}
+现在两个 16×16 小块已经准备好。继续看线程 $(x,y)=(3,2)$：它读 \code{tileA[2][k]} 和 \code{tileB[k][3]}，固定 A 的行 2、B 的列 3，\textbf{共同改变 k}。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\fill[PaleBlue] (0,0) rectangle (4,4);
+\fill[Orange!35] (0,3.25) rectangle (4,3.5);
+\draw[step=0.25,gray!40] (0,0) grid (4,4);
+\draw[Blue,thick] (0,0) rectangle (4,4);
+\draw[thinarr] (0.1,3.375)--(3.9,3.375);
+\fill[Orange] (1.5,3.25) rectangle (1.75,3.5);
+\draw[Orange!70!black,thick] (1.5,3.25) rectangle (1.75,3.5);
+\node[lbl] at (2,4.5) {Shared tileA：16×16};
+\node[lbl] at (2,-0.65) {固定行 y=2\\k 沿这行从 0 走到 15};
+\fill[PaleBlue] (5.3,0) rectangle (9.3,4);
+\fill[Orange!35] (6.05,0) rectangle (6.3,4);
+\draw[step=0.25,gray!40,xshift=5.3cm] (0,0) grid (4,4);
+\draw[Blue,thick] (5.3,0) rectangle (9.3,4);
+\draw[thinarr] (6.175,3.9)--(6.175,0.1);
+\fill[Orange] (6.05,2.25) rectangle (6.3,2.5);
+\draw[Orange!70!black,thick] (6.05,2.25) rectangle (6.3,2.5);
+\node[lbl] at (7.3,4.5) {Shared tileB：16×16};
+\node[lbl] at (7.3,-0.65) {固定列 x=3\\k 沿这列从 0 走到 15};
+\fill[PaleGreen] (10.6,0) rectangle (14.6,4);
+\draw[step=0.25,gray!40,xshift=10.6cm] (0,0) grid (4,4);
+\draw[Green,thick] (10.6,0) rectangle (14.6,4);
+\fill[Orange] (11.35,3.25) rectangle (11.6,3.5);
+\node[lbl] at (12.6,4.5) {本地 C 输出：16×16};
+\node[lbl] at (12.6,-0.65) {只更新本地 C[2,3]\\对应全局 C[18,35]};
+\node at (4.65,2) {$\times$};\node at (9.95,2) {$\to$};
+\end{tikzpicture}
+\caption{这才是“计算一个输出”的读取方向：A 行×B 列。深橙格示例 k=6，读取 A[18,6] 和 B[6,35]；行号从上向下增加。}
+\end{figure}
+
+\src{versions/v1_shared_memory.cu}{38--42}
+\lstinputlisting[firstline=38,lastline=42,firstnumber=38]{versions/v1_shared_memory.cu}
+\begin{table}[H]\centering\small
+\begin{tabular}{rllll}
+\toprule
+k & 读取的 Shared A & 由线程 $(x,y)$ 搬入 & 读取的 Shared B & 由线程 $(x,y)$ 搬入\\\midrule
+0 & $tileA[2][0]$ & $(0,2)$ & $tileB[0][3]$ & $(3,0)$\\
+1 & $tileA[2][1]$ & $(1,2)$ & $tileB[1][3]$ & $(3,1)$\\
+2 & $tileA[2][2]$ & $(2,2)$ & $tileB[2][3]$ & $(3,2)$\\
+3 & $tileA[2][3]$ & $(3,2)$ & $tileB[3][3]$ & $(3,3)$\\
+15 & $tileA[2][15]$ & $(15,2)$ & $tileB[15][3]$ & $(3,15)$\\\bottomrule
+\end{tabular}
+\end{table}
+这一轮结束后，线程的 sum 增加 $\sum_{k=0}^{15}A[18,k]B[k,35]$。\textbf{读了 16 个 A 和 16 个 B，做了 16 次乘加}；只是大部分输入是其他线程搬入 Shared 的。
+\pagebreakhere
+
+\subsection{换一个视角：固定 k 时，全部输出做一次外积更新}
+单个线程的视角是“固定输出，遍历 k 做点积”。把所有线程合起来，并固定某个 k，则是 A tile 的\textbf{一列 16 个值}与 B tile 的\textbf{一行 16 个值}交叉配对，给全部 16×16 输出各增加一项。
+\[
+\Delta C_{y,x}^{(k)}=tileA[y][k]\,tileB[k][x],\quad y,x=0\ldots15.
+\]
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.9cm,y=0.9cm]
+\draw[Blue,fill=PaleBlue] (0,0) rectangle (1.2,4.8);
+\node[lbl] at (0.6,5.4) {$tileA[:,k]$};
+\node[lbl] at (0.6,2.4) {16\\个 A};
+\node[lbl] at (0.6,-0.6) {16×1};
+\draw[Blue,fill=PaleBlue] (3,1.8) rectangle (7.8,3);
+\node[lbl] at (5.4,3.6) {$tileB[k,:]$};
+\node[lbl] at (5.4,2.4) {16 个 B};
+\node[lbl] at (5.4,1.2) {1×16};
+\draw[Green,fill=PaleGreen] (9.6,0) rectangle (14.4,4.8);
+\node[lbl] at (12,5.4) {$\Delta C^{(k)}$};
+\node[lbl,text width=4.5cm] at (12,2.4) {16×16 个乘积\\256 个线程\\每线程更新 1 个 sum};
+\node[lbl] at (12,-0.6) {只贡献一项，不是最终点积};
+\node at (2.1,2.4) {$\times$};\node at (8.7,2.4) {$=$};
+\end{tikzpicture}
+\caption{列×行在这里表示外积，结果是矩阵；行×列点积得到标量。两种视角表达同一组乘法，不是修改了矩阵乘法规则。}
+\end{figure}
+
+因此整轮 K tile 的贡献可以写成\textbf{16 次外积相加}：
+\[
+\Delta C_{tile}=\sum_{k=0}^{15} tileA[:,k]\,tileB[k,:].
+\]
+以 k=6 为例，$A[18,6]$ 会参与输出 $C[18,32]$ 至 $C[18,47]$ 的更新；$B[6,35]$ 会参与 $C[16,35]$ 至 $C[31,35]$ 的更新。两者的交点就是我们一直看的 $C[18,35]$。
+
+\textbf{这也解释了共享复用：}A 的每个输入供 16 个输出列使用，B 的每个输入供 16 个输出行使用。256 个输出无需分别从 Global 再加载一遍输入。
+
+\caution{这是按 k 分解的数学视角，不要求整个 Block 在每一个 k 都锁步同步。Shared 在本轮计算期间保持不变，各线程可按调度推进自己的 sum；Block barrier 设在加载/覆盖边界，而不是每次乘加之间。}
+\takeaway{看一个输出：A 一行×B 一列，沿 k 累加。看某个固定 k 的所有输出：A 一列×B 一行做外积。看加载：一次搬 A/B 各 16×16 小块。三个视角必须分开。}
+\pagebreakhere
+
+\subsection{步骤 4--6：保护旧块、推进 K 段、最后写回}
+假设 K=32，只需两轮。Block 与线程的输出坐标始终不变，变的只是输入的 K 起点：
+\begin{table}[H]\centering\small
+\begin{tabular}{rlll}
+\toprule
+轮次 t & 当前 K 下标 & 线程 $(3,2)$ 计算需要的 A & 计算需要的 B\\\midrule
+0 & 0--15 & $A[18,0]\ldots A[18,15]$ & $B[0,35]\ldots B[15,35]$\\
+1 & 16--31 & $A[18,16]\ldots A[18,31]$ & $B[16,35]\ldots B[31,35]$\\\bottomrule
+\end{tabular}
+\end{table}
+注意 t=1 时，该线程自己搬的是 $A[18,19]$、$B[18,35]$，写入的 Shared 坐标仍是 $[2][3]$。\textbf{Shared 下标不变，但所代表的全局 K 段变了。}
+
+记第一轮贡献为 $S_0$、第二轮为 $S_1$，线程的私有累加器经历
+\[
+sum=0\ \longrightarrow\ sum=S_0\ \longrightarrow\ sum=S_0+S_1
+=\sum_{q=0}^{31}A[18,q]B[q,35].
+\]
+sum 在循环外初始化，因此第二轮\textbf{不会清零}。所有轮次完成后，才执行第 47--48 行的 C 写回，不在每轮把部分结果来回写到 Global。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=5mm]
+\node[box,text width=2.5cm] (l) {加载本轮 A/B\\写 Shared};
+\node[warnbox,right=of l,text width=2cm] (s1) {barrier (1)\\写完再读};
+\node[calcbox,right=of s1,text width=2.5cm] (c) {本轮 16 次\\乘加};
+\node[warnbox,right=of c,text width=2cm] (s2) {barrier (2)\\读完再覆盖};
+\draw[arrow] (l)--(s1);\draw[arrow] (s1)--(c);\draw[arrow] (c)--(s2);
+\draw[arrow] (s2.south)--++(0,-0.7)-|(l.south);
+\end{tikzpicture}
+\caption{每轮先确认“写完再读”，再确认“读完再覆盖”；下一轮复用同一份 Shared，sum 则一直留在各线程中。}
+\end{figure}
+
+\textbf{第一次 barrier（第 36 行）：}避免读到其他线程尚未写好的输入。\textbf{第二次 barrier（第 44 行）：}避免快线程开始下一轮覆盖 Shared，而慢线程还在读上一轮。两个 barrier 解决不同方向的数据竞争。
+
+\textbf{K 不足整段怎么办？}若 K=20，第二轮只含全局 K 下标 16--19 的四个有效值；下标 20--31 的 A/B 位置补 0。内部仍执行 16 个 k，其中 12 项贡献为 0，最终得到完整的 20 项点积。
+
+\textbf{C 边缘线程为什么不能提前返回？}例如 M=17、N=18，最后一个 Block 中线程 $(x,y)=(0,1)$ 的输出 $C[17,16]$ 越界；但第 0 轮它搬的 $B[1,16]$ 仍被有效输出 $C[16,16]$ 的线程需要。它还要参与 Block barrier，因此应按输入边界补 0，最后才按输出边界决定是否存 C。
+\takeaway{一个 C 元素需要全部 K 项。BK=16 只负责分段；Shared 每轮覆盖，sum 跨轮保留，C 最后写一次。}
+\pagebreakhere
+
+\subsection{缩小为 4×4，逐步算出一个具体结果}
+为让数字能全部写出，本页\textbf{仅把示意尺寸缩成 4×4、BK=4、16 线程}；项目实际代码仍是 16×16、BK=16、256 线程。
+\[
+A_* = \begin{bmatrix}1&2&3&4\\5&6&7&8\\9&10&11&12\\13&14&15&16\end{bmatrix},\qquad
+B_* = \begin{bmatrix}1&0&2&1\\0&1&1&2\\1&2&0&1\\2&1&1&0\end{bmatrix}.
+\]
+选择线程 $(x,y)=(2,1)$，负责 $C_*[1,2]$。它自己搬 $A_*[1,2]=7$、$B_*[1,2]=1$ 到 Shared 的 $[1][2]$。其他 15 个线程搬其他位置，两块输入共同准备好后同步。
+
+它的完整点积要用 A 第 1 行 $[5,6,7,8]$ 和 B 第 2 列 $[2,1,0,1]^T$，\textbf{不是只把自己搬的 7 和 1 相乘}：
+\begin{table}[H]\centering\small
+\begin{tabular}{rllrr}
+\toprule
+k & Shared A 值 / 搬入线程 $(x,y)$ & Shared B 值 / 搬入线程 $(x,y)$ & 本项乘积 & sum\\\midrule
+0 & $A_*[1,0]=5$ / $(0,1)$ & $B_*[0,2]=2$ / $(2,0)$ & 10 & 10\\
+1 & $A_*[1,1]=6$ / $(1,1)$ & $B_*[1,2]=1$ / $(2,1)$ & 6 & 16\\
+2 & $A_*[1,2]=7$ / $(2,1)$ & $B_*[2,2]=0$ / $(2,2)$ & 0 & 16\\
+3 & $A_*[1,3]=8$ / $(3,1)$ & $B_*[3,2]=1$ / $(2,3)$ & 8 & 24\\\bottomrule
+\end{tabular}
+\caption{不同 k 使用不同的输入；所有输入已在 Shared 中，计算阶段不再让对应生产线程重新搬一次。}
+\end{table}
+因此 $C_*[1,2]=5\times2+6\times1+7\times0+8\times1=24$。同时，其他线程按同样规则算各自输出。\textbf{线程的生产任务是一对输入，消费任务是一整行与一整列。}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=8mm]
+\node[box,text width=3.4cm] (load) {线程 $(2,1)$ 先搬\\A[1,2]=7、B[1,2]=1};
+\node[warnbox,right=of load,text width=2.4cm] (sync) {与其他线程\\共同加载后同步};
+\node[calcbox,right=of sync,text width=4.2cm] (comp) {读 A 行与 B 列\\sum: 0→10→16→16→24};
+\draw[arrow] (load)--(sync);\draw[arrow] (sync)--(comp);
+\end{tikzpicture}
+\caption{先把协作加载完成，才跨线程消费数据。sum 属于当前线程，不需要让其他线程来累加它。}
+\end{figure}
+
+\textbf{放回实际 V1：}把本页四个 k 扩展为 16 个 k，把 16 个输出线程扩展为 256 个，点积规则与生产/消费关系完全相同。若 K 更长，就把同样过程重复多个 K tile，并保持 sum。
+\pagebreakhere
+
+\subsection{每线程读多少、复用多少：统一计数口径}
+下表对齐\textbf{一个完整且无边界填充的 BK=16 段}，Shared 计数指源码逻辑标量读取，不是银行事务或 DRAM 实测流量：
+\begin{table}[H]\centering
+\begin{tabular}{lll}
+\toprule
+操作 & 单线程 & 整个 256 线程 Block\\\midrule
+Global → Shared 搬运 & 1 个 A + 1 个 B & 256 个 A + 256 个 B\\
+Shared → 计算输入读取 & 16 个 A + 16 个 B & 4096 次 A + 4096 次 B 读取\\
+乘加次数 & 16 & 4096\\
+输出累加器数 & 1 个 sum & 256 个私有 sum\\\bottomrule
+\end{tabular}
+\end{table}
+\textbf{为什么 Global 只搬 1+1，计算却能读 16+16？}不是这个线程搬来的两个值被凭空扩展，而是整个 Block 共同准备了 A/B 两个小块，随后每线程读取自己需要的 32 个值。Global 加载的分工与 Shared 读取的分工不同。
+
+K=1024 时有 64 轮，每线程协作搬 64 个 A、64 个 B；计算自己输出时共从 Shared 读 1024 个 A、1024 个 B，做 1024 次乘加。Shared 在每轮更新，因此这些计算输入覆盖了该输出完整的 K 长度。
+
+\subsection{16 次共享复用带来的逻辑收益}
+每轮输入是 $16^2+16^2=512$ 个 float，即 2048 字节；计算是 $16^3=4096$ 次乘加，即 8192 FLOP。
+\[
+I_{V1,\mathrm{tile}}=\frac{2\times16^3}{4(16^2+16^2)}=4\ \mathrm{FLOP/B}.
+\]
+每个 A 元素用于 16 列输出；每个 B 元素用于 16 行输出。对相同输出工作量，\textbf{理想 tile 输入请求量}相对 V0 的源码逐输出请求减少 16 倍；实际速度不等于 16 倍，还要看缓存、同步、Shared 指令及硬件利用率。
+
+\subsection{V1 为什么还可以继续优化}
+每线程仍只保存一个 sum。固定 k 时，线程只从 Shared 取一个 A、一个 B，做一次乘加。V2 将改为每线程保留多个输出，用一小组输入更新多个累加器，从而继续增加\textbf{寄存器内复用}。
+\takeaway{V1 把输入搬到 Shared 后在 Block 内复用；V2 要在此基础上让同一线程把读到寄存器的输入再复用。两层复用不是同一件事。}
+\pagebreakhere
+
+\input{report/sections/V2_Register_Tiling_Detailed.tex}
+
+\section{V3：Vectorized Load——把连续四个 float 一起搬}
+\subsection{V2 与 V3 改变的是加载，不是计算输出坐标}
+V3 保留 V2 的 64×64×16 分块、256 线程、每线程 4×4 累加器、Shared 布局及计算映射。新内容是\textbf{每线程分别用一个 float4 加载 A/B 的连续四个 float}。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.95cm,y=0.85cm]
+\node[lbl,anchor=west] at (0,2.8) {V2：同线程四次标量读取，相隔 256 个 tile 元素};
+\foreach \x/\s in {0/3,3/259,6/515,9/771} {\node[box,minimum width=1.7cm] at (\x+1,1.8) {index=\s};}
+\node[lbl,anchor=west] at (0,0.4) {V3：同线程一次 float4 读取，连续四个元素};
+\foreach \x/\s in {0/12,1/13,2/14,3/15} {\node[calcbox,minimum width=0.9cm] at (\x+1,-0.6) {\s};}
+\draw[Orange,thick] (0.45,-1.35) rectangle (4.55,0.15);
+\node[lbl,text width=5.6cm] at (8,-0.6) {这里示例都是 tid=3 的 A 加载\\V3 读取 tileA 第 0 行第 12--15 列};
+\end{tikzpicture}
+\caption{每线程加载的相邻性改变；Warp 的合并访问也要一起核对。两版本 tile 总输入字节数相同。}
+\end{figure}
+
+\subsection{vectorRow 与 vectorCol 怎么确定}
+设 $t=16y+x$。一个 float4 占 4 列，因此 A 一行有 $16/4=4$ 个向量，B 一行有 $64/4=16$ 个向量：
+\[
+aRow=\lfloor t/4\rfloor,\quad aCol=4(t\bmod4);
+\qquad bRow=\lfloor t/16\rfloor,\quad bCol=4(t\bmod16).
+\]
+\begin{table}[H]\centering
+\begin{tabular}{rll}
+\toprule
+t & A tile 的一组四列 & B tile 的一组四列\\\midrule
+0 & row 0，col 0--3 & row 0，col 0--3\\
+1 & row 0，col 4--7 & row 0，col 4--7\\
+3 & row 0，col 12--15 & row 0，col 12--15\\
+4 & row 1，col 0--3 & row 0，col 16--19\\
+16 & row 4，col 0--3 & row 1，col 0--3\\
+255 & row 63，col 12--15 & row 15，col 60--63\\\bottomrule
+\end{tabular}
+\end{table}
+256 组×4 个值刚好覆盖 1024 个 A，以及 1024 个 B，无重叠、无遗漏。全局 A 的列还要加 tileK，全局 B 的列还要加 blockCol。
+\pagebreakhere
+
+\subsection{把 reinterpret\_cast 逐步拆开}
+\src{versions/v3_vectorized_load.cu}{24--32（helper 全文见 11--35 行）}
+\lstinputlisting[firstline=24,lastline=32,firstnumber=24]{versions/v3_vectorized_load.cu}
+\begin{enumerate}
+\item \code{offset = row * cols + col}：找到这组数据中第一个 float 的一维下标。
+\item \code{matrix + offset}：得到指向这个 float 的地址，指针加法自动按 \code{sizeof(float)} 前进。
+\item \code{reinterpret_cast<const float4*>}：把同一地址解释成“指向四个 float 的向量”的指针；\textbf{不是数值转换，也没有在此时复制数据}。
+\item 最外面的 \code{*}：读取向量，四个分量对应 \code{value.x/y/z/w}。
+\end{enumerate}
+例如 row=2、cols=16、col=4，offset=36；向量覆盖一维元素 36、37、38、39，总计 16 字节。随后程序把四个分量写入 Shared 对应四列。
+
+\subsection{16 字节对齐与边界回退}
+float4 加载需要适当对齐。在本 kernel 中，\code{cudaMalloc} 基址满足对齐；A/B 的起始向量列都是 4 的倍数；快速路径要求行宽 \code{cols} 是 4 的倍数。因此 float 下标也是 4 的倍数，字节地址为 16 的倍数。
+
+\caution{V3 的 helper 自身\textbf{没有显式检查 col\%4==0}，它依赖当前调用点保证这一条件。把这个函数拿去读取任意 col 时必须补充对齐检查；它不是对任意地址都安全的通用 float4 reader。}
+当最后一组不足四个元素，或行宽不是 4 的倍数时，走标量加载与零填充分支。正确性优先于向量化比例；边缘矩阵可能不能走同样的快路径。
+
+\subsection{优化的边界}
+float4 可以给编译器生成宽加载的机会，减少加载指令数及地址计算开销。但 V2 的相邻线程标量读取已有合并机会，V3 不减少 tile 输入的总字节数，也\textbf{不表示带宽或性能必然提升四倍}。应查看最终 SASS 里的加载宽度和 NCU 指标。
+\takeaway{连续的是 Global 加载阶段每线程的一组四个 float。计算阶段 regA 的四行、regB 的四列和 C 的分散输出映射，仍然和 V2 一样。}
+\pagebreakhere
+
+\section{V4：Double Buffer——提前取下一块，不覆盖当前块}
+\subsection{为什么要两套 Shared buffer}
+V3 是“加载当前 tile → 计算当前 tile → 再加载下一 tile”。V4 增加两套 Shared A/B：一套给当前计算使用，一套给下一轮准备。\code{currentBuffer ^ 1} 在 0 和 1 之间切换。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm and 10mm]
+\node[box,text width=3.4cm] (g) {下一 tile 的 Global A/B};
+\node[box,right=of g,text width=3.4cm] (r) {预取到 nextA/nextB\\两个 float4 寄存器变量};
+\node[box,below=of r,text width=3.4cm] (n) {计算结束后写入\\Shared[nextBuffer]};
+\node[calcbox,left=of n,text width=3.4cm] (c) {从 Shared[currentBuffer]\\计算当前 tile};
+\draw[arrow] (g)--(r);\draw[arrow] (r)--(n);
+\draw[arrow,dashed] (r)--node[above,font=\scriptsize,sloped]{预取后先计算}(c);
+\draw[arrow] (c)--node[above,font=\scriptsize]{算完再准备}(n);
+\node[warnbox,right=of n,text width=2.3cm] (s) {Block barrier\\然后交换 buffer};
+\draw[arrow] (n)--(s);
+\end{tikzpicture}
+\caption{V4 仍经过 Global → Registers → Shared。下一块写 Shared 发生在当前块计算之后。}
+\end{figure}
+
+\subsection{启动、循环与收尾}
+\src{versions/v4_double_buffer.cu}{60--77、81--144}
+\begin{lstlisting}[numbers=none]
+// Equivalent pseudocode; not a verbatim source excerpt.
+load tile 0 into firstA / firstB;
+write firstA / firstB to shared[0];
+__syncthreads();
+current = 0;
+for each K tile:
+    next = current ^ 1;
+    if hasNext: load next tile into nextA / nextB;
+    compute current tile from shared[current];
+    if hasNext:
+        write nextA / nextB to shared[next];
+        __syncthreads();
+        current = next;
+store accumulators to C;
+\end{lstlisting}
+第一次必须先准备 tile 0，没有可以重叠的前一轮计算。最后一轮没有下一 tile，不再预取和交换。虽然有两套 Shared，\textbf{下一轮数据在计算期间首先停留在预取寄存器中}，不是此时就已写入另一套 Shared。
+\pagebreakhere
+
+\subsection{源代码中“预取后先计算”在哪里}
+\src{versions/v4_double_buffer.cu}{89--108、131--143}
+\lstinputlisting[firstline=89,lastline=108,firstnumber=89]{versions/v4_double_buffer.cu}
+以上 \code{nextA/nextB} 在本轮计算之前加载；随后第 108--129 行只读 \code{tileA/B[currentBuffer]} 做计算。直到第 132--140 行，才消费 \code{nextA/nextB} 并写入 \code{nextBuffer}。
+
+\subsection{普通加载是否必须等完才执行下一条计算}
+不能把 GPU 想成“每条加载都完全结束，才能执行任何下一条指令”。普通 Global load 的结果可能尚未准备好，若随后指令不依赖这个结果，硬件记分牌与编译器调度\textbf{可能允许独立计算先进行}。V4 通过延后使用 nextA/nextB，给这种指令级预取留下空间。
+
+但普通加载路径没有 \code{cp.async} 的显式 Global→Shared 异步语义。真实重叠取决于最终指令顺序、依赖关系、资源和调度；\textbf{两套数组或提前写一行 C++ 代码，不足以证明延迟已被隐藏}。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.9cm,y=0.8cm]
+\node[lbl,anchor=east] at (0,1.2) {V3 顺序结构};
+\draw[fill=PaleBlue,draw=Blue] (0.3,0.8) rectangle (2.8,1.6);
+\node[lbl] at (1.55,1.2) {加载 $t+1$};
+\draw[fill=PaleGreen,draw=Green] (2.8,0.8) rectangle (6.4,1.6);
+\node[lbl] at (4.6,1.2) {计算 $t+1$};
+\node[lbl,anchor=east] at (0,-0.5) {V4 预取机会};
+\draw[fill=PaleBlue,draw=Blue] (0.3,-0.2) rectangle (3.5,0.5);
+\node[lbl] at (1.9,0.15) {预取 $t+1$（寄存器）};
+\draw[fill=PaleGreen,draw=Green] (0.9,-1.1) rectangle (4.8,-0.4);
+\node[lbl] at (2.85,-0.75) {独立计算 $t$};
+\draw[fill=PaleOrange,draw=Orange] (4.8,-1.1) rectangle (7.5,-0.4);
+\node[lbl] at (6.15,-0.75) {写 Shared + 同步};
+\draw[arrow] (0.3,-1.65)--(9,-1.65) node[right,lbl]{时间};
+\end{tikzpicture}
+\caption{下行只是可能的调度示意，不是实测时间线。两个版本图中的工作片段也不能直接用长度计算加速比。}
+\end{figure}
+
+\textbf{代价：}Shared 翻倍到 16.5 KiB，增加预取输入的寄存器生存期。若因此减少同驻 Block，可能抵消延迟隐藏的收益。下一步 V5 将直接发起 Global→Shared 异步拷贝，省去 nextA/nextB 这种输入寄存器暂存路径。
+\pagebreakhere
+
+\section{V5：cp.async——显式异步搬运与计算流水线}
+\subsection{关键指令：CUDA C++ 中嵌入 PTX}
+\src{versions/v5_cp_async.cu}{44--64}
+\lstinputlisting[firstline=44,lastline=64,firstnumber=44]{versions/v5_cp_async.cu}
+第 44 行的 \code{__CUDA_ARCH__ >= 800} 是\textbf{设备编译目标}条件，不是运行时 GPU 查询。第 45--49 行检查整组四个 float 在边界内且列/行宽满足向量对齐。
+
+第 52 行定位 Global 地址。第 53--55 行把通用指针转换成 Shared 地址空间中的地址表示；\code{"r"} 传入 32 位 shared 地址，\code{"l"} 传入 64 位 global 指针。它们是内联汇编的操作数约束，\code{\%0/\%1} 对应两个输入操作数。
+
+第 58 行每次从 Global 搬 16 字节到 Shared。\code{cp.async} 是 NVIDIA PTX 的异步拷贝指令；PTX 是面向 GPU 的虚拟指令集，最终还会转成实际架构的机器指令，而不是直接等同于 SASS\cite{ptx}。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm]
+\node[box,text width=3.2cm] (g) {Global 的连续 16 字节};
+\node[box,right=of g,text width=3.5cm] (s) {Shared[next] 的 16 字节};
+\node[calcbox,right=of s,text width=3.2cm] (c) {稍后 Shared→Registers\\进行计算};
+\draw[arrow] (g)--node[above,font=\scriptsize]{cp.async}(s);
+\draw[arrow] (s)--(c);
+\node[lbl,text width=11cm,below=8mm of s] {输入搬运不再需要 V4 的 nextA/nextB float4 暂存；\\当前计算仍使用自己的 regA/regB 和 accum。};
+\end{tikzpicture}
+\caption{“不经寄存器暂存”指输入 Global→Shared 拷贝，不是整个计算不使用寄存器。}
+\end{figure}
+\caution{\code{asm volatile} 并不意味着“拷贝已完成”，也不替代等待或线程块同步；正确性来自后面的 commit、wait 和 barrier 的配合。}
+\pagebreakhere
+
+\subsection{真正留下重叠窗口的代码结构}
+\src{versions/v5_cp_async.cu}{114--193}
+\begin{lstlisting}[numbers=none]
+// Equivalent pseudocode of the actual two-buffer pipeline.
+issue_async_copy(tile0, shared[0]);
+commitAsyncCopies();
+waitForAsyncCopies();
+__syncthreads();
+current = 0;
+for each K tile:
+    next = current ^ 1;
+    if hasNext:
+        issue_async_copy(nextTile, shared[next]);
+        commitAsyncCopies();
+    compute(shared[current]);   // independent of shared[next]
+    if hasNext:
+        waitForAsyncCopies();
+        __syncthreads();
+        current = next;
+\end{lstlisting}
+\textbf{重叠的核心是发起与等待之间夹着当前 tile 的计算。}第 143--162 行向 nextBuffer 发起并提交；第 165--187 行只读 currentBuffer 计算；第 189--192 行在下一轮需要新 tile 时才等待并切换。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.85cm,y=0.9cm]
+\node[lbl,anchor=east] at (0,1.4) {拷贝通道};
+\node[lbl,anchor=east] at (0,0.2) {计算通道};
+\foreach \t/\start/\buf in {0/0.3/0,1/3.1/1,2/6.3/0} {
+\draw[fill=PaleBlue,draw=Blue] (\start,1) rectangle (\start+2.6,1.8);
+\node[lbl] at (\start+1.3,1.4) {搬 tile \t → buf \buf};}
+\foreach \t/\start/\buf in {0/3.1/0,1/6.3/1,2/9.5/0} {
+\draw[fill=PaleGreen,draw=Green] (\start,-0.2) rectangle (\start+2.9,0.6);
+\node[lbl] at (\start+1.45,0.2) {算 tile \t（buf \buf）};}
+\foreach \x in {3,6.2,9.4} {\draw[Orange,thick,dashed] (\x,-0.7)--(\x,2.15);}
+\node[lbl,text=Orange] at (6.2,2.7) {虚线：wait + barrier，确认新块就绪再切换};
+\draw[arrow] (0.3,-1)--(12.8,-1) node[right,lbl]{时间};
+\end{tikzpicture}
+\caption{理想流水线示意：第一块先加载，稳态复制下一块并计算当前块，最后只计算。示意长度不代表测得延迟。}
+\end{figure}
+
+假设每段加载时间 L、计算时间 P、共 T 个 tile，忽略同步及其他开销，完全顺序约 $T(L+P)$，理想重叠约 $L+(T-1)\max(L,P)+P$。即使做到理想重叠，也不可能任意加速；K 很短时，启动/收尾尤其明显。
+\takeaway{V5 显式实现了允许访存与独立计算重叠的机制；是否重叠充分、是否更快，仍需在具体 GPU 上测量。}
+\pagebreakhere
+
+\subsection{commit、wait 和 barrier 各管什么}
+\src{versions/v5_cp_async.cu}{74--85、189--193}
+\noindent\begin{tabularx}{\linewidth}{lX}
+\toprule
+操作 & 在本版本中的职责\\\midrule
+\code{cp.async.commit_group} & 将\textbf{本线程}尚未提交的拷贝组成一组\\
+\code{cp.async.wait_group 0} & 等\textbf{本线程}之前提交的拷贝组全部完成\\
+\code{__syncthreads()} & 所有线程到达同一位置，然后跨线程安全消费已准备好的 Shared\\
+\code{currentBuffer = nextBuffer} & 将下一 tile 设为新的当前输入\\\bottomrule
+\end{tabularx}
+PTX 的 group/wait 语义是按线程定义的\cite{ptx}。每个线程只等待自己的 A/B 部分，然后所有线程通过 Block barrier 汇合，才能读取其他线程搬来的元素。\textbf{wait 不等于全 Block 就绪；只有 barrier 而不等待，也不能保证异步拷贝已经完成。}
+
+双缓冲还要避免覆盖仍被读取的旧 buffer。本版本在轮次交界通过 barrier 保证 Block 都完成当前计算；下一轮再把旧 buffer 当作 next 写入，就不会和上一轮的读取竞争。最后一轮没有下一拷贝，不需要为不存在的数据追加等待。
+
+\subsection{为什么 V5 的 tileA 不再补 1}
+\src{versions/v5_cp_async.cu}{96--99}
+\lstinputlisting[firstline=96,lastline=99,firstnumber=96]{versions/v5_cp_async.cu}
+每个拷贝目的地址都要适合 16 字节访问。A 行宽 16 float 时，行跨度为 $16\times4=64$ 字节，各行开头都保持 16 字节对齐；若补成 17 float，跨度是 68 字节，就不能保证每行的四元素段都有 16 字节对齐。\code{__align__(16)} 只保证数组起点，不会自动修复 68 字节的行跨度。
+
+删除 padding 是对\textbf{这个直接宽拷贝布局}的调整。不能笼统说“异步要求所有矩阵都不许 padding”；也可以采用满足对齐的其他 padding 或 swizzle 布局，但需要重新设计地址映射。
+
+\subsection{哪些情况不走异步路径}
+完整对齐组走 cp.async，边界或不满足向量条件的组用普通标量加载、补 0，再写 Shared。main 还要求运行设备 Compute Capability 至少 8.0，编译生成的 kernel 版本至少 sm\_80，否则输出 SKIPPED。\textbf{支持 CUDA 不等于支持当前 V5 的异步指令。}
+
+\caution{V5 仍有 16 个每线程累加器及输入计算寄存器，但双缓冲 Shared 是 16 KiB。它可能减少搬运暂存寄存器，却不保证真实总寄存器数必然更少；编译器调度和生存期都可能改变结果。}
+\pagebreakhere
+
+\section{V6：Warp Tiling——显式安排一个 Warp 算 32×32}
+\subsection{Block 内分成四个 Warp tile}
+V6 仍算 64×64 输出，BK=16，但改成 4 个 Warp 共 128 线程。launch 是 \code{dim3 block(32,4)}；一个 Warp 分配 32×32 输出，四个 Warp 组成 2×2 网格。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.9cm,y=0.9cm]
+\draw[fill=PaleBlue,draw=Blue,thick] (0,0) rectangle (6.4,6.4);
+\draw[Blue,thick] (3.2,0)--(3.2,6.4);\draw[Blue,thick] (0,3.2)--(6.4,3.2);
+\node[lbl] at (1.6,4.8) {Warp 0\\row 0--31\\col 0--31};
+\node[lbl] at (4.8,4.8) {Warp 1\\row 0--31\\col 32--63};
+\node[lbl] at (1.6,1.6) {Warp 2\\row 32--63\\col 0--31};
+\node[lbl] at (4.8,1.6) {Warp 3\\row 32--63\\col 32--63};
+\node[lbl] at (3.2,7) {Block 输出 64×64};
+\node[calcbox,text width=5cm] at (10.2,4.7) {每个 Warp：32 线程\\每线程：8×4 输出\\32×8×4 = 1024 输出};
+\node[lbl,text width=5cm] at (10.2,1.8) {四个 Warp 共 4096 个输出\\加载仍是全 Block 协作\\Shared A/B 仍供跨 Warp 使用};
+\end{tikzpicture}
+\caption{Warp tile 定义的是 C 的责任范围，不代表每个 Warp 自己拥有一套独立 Shared A/B。}
+\end{figure}
+
+\src{versions/v6_warp_tiling.cu}{54--64}
+\lstinputlisting[firstline=54,lastline=64,firstnumber=54]{versions/v6_warp_tiling.cu}
+\code{linearThread / 32} 得 Warp 编号，\code{\%32} 得 lane 编号。Warp 沿 N 方向有两个，所以 \code{warpRow=warpId/2}、\code{warpCol=warpId\%2}。
+
+\caution{V6 是\textbf{单缓冲、普通 float4 加载}，没有调用 V5 的 cp.async helper。阅读或汇报时不要把“Warp Tiling”说成“在异步双缓冲上加一层 Warp”，这不是当前源码的组合方式。}
+\pagebreakhere
+
+\subsection{一个 Warp 的 32 lanes 如何覆盖 32×32 输出}
+V6 把 lane 排成逻辑上的 4 行×8 列：
+\[
+laneRow=\lfloor laneId/8\rfloor,\qquad laneCol=laneId\bmod8.
+\]
+每个 lane 在 Warp 区域内每隔 4 行选一行，每隔 8 列选一列：
+\begin{align*}
+r_i&=r_0+32\,\mathrm{warpRow}+4i+\mathrm{laneRow},\quad i=0\ldots7;\\
+c_j&=c_0+32\,\mathrm{warpCol}+8j+\mathrm{laneCol},\quad j=0\ldots3.
+\end{align*}
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.73cm,y=0.73cm]
+\foreach \r in {0,1,2,3} {\foreach \c in {0,1,2,3,4,5,6,7} {
+\pgfmathtruncatemacro{\id}{8*\r+\c}
+\draw[fill=PaleBlue,draw=gray!50] (\c,-\r) rectangle (\c+1,-\r+1);
+\node[font=\small] at (\c+0.5,-\r+0.5) {\id};}}
+\draw[Orange,very thick] (3,-1) rectangle (4,0);
+\node[lbl] at (4,1.8) {laneId 逻辑排列（4×8）};
+\node[calcbox,text width=6cm] at (12,0) {以 Warp 0 的 lane 11 为例：\\laneRow=1，laneCol=3\\[0.4em]
+输出行：1,5,9,13,17,21,25,29\\输出列：3,11,19,27\\[0.4em]这些行列交叉构成 32 个输出};
+\draw[arrow] (4,-0.5)--(7.7,-0.5);
+\node[lbl,text width=12cm] at (7,-4.2) {每个 4×8 子格有全部 32 个 lane；沿 M 重复 8 次、沿 N 重复 4 次，\\所以每个 32×32 Warp tile 的每个输出都恰好被一个 lane 负责。};
+\end{tikzpicture}
+\caption{lane 组织是软件定义的坐标映射，不是 Warp 必须在硬件上排成 4×8。}
+\end{figure}
+
+\subsection{计算阶段仍然是寄存器外积}
+\src{versions/v6_warp_tiling.cu}{120--151}
+固定 k 时，每线程从 Shared 取 regA[8]、regB[4]，更新 accum[8][4]，即\textbf{12 个输入供 32 次乘加}。重复 16 个 k 后，每输出仍完成 16 项点积贡献。
+
+不用 \code{__shfl_sync} 也可以称为 Warp Tiling：本版本通过明确输出责任和 Shared 访问布局组织 Warp，输入仍由 Shared 提供；不是所有 Warp 级优化都必须线程间 shuffle。
+\takeaway{V6 的核心是四个 Warp 的责任范围和 lane 的 4×8 映射。线程输出仍然是分散点集，8×4 描述的是累加器数量。}
+\pagebreakhere
+
+\input{report/sections/V6_Read_Grid.tex}
+\subsection{128 个线程怎样加载同样大小的 A/B tile}
+\src{versions/v6_warp_tiling.cu}{66--80}
+\lstinputlisting[firstline=66,lastline=80,firstnumber=66]{versions/v6_warp_tiling.cu}
+A/B 各有 1024 float，即 256 个 float4。线程减半后，每线程处理向量下标 $t$ 和 $t+128$，所以\textbf{每 K tile 搬两组 A float4、两组 B float4，合计 8 个 A + 8 个 B}。输入总量没有变，只是分给更少线程。
+
+\subsection{比较 V2 与 V6：要按相同 Block 工作量比较}
+\begin{table}[H]\centering
+\begin{tabular}{lrr}
+\toprule
+每个 BK=16 段 & V2（V3 同计算） & V6\\\midrule
+Block 线程数 & 256 & 128\\
+每线程累加器数 & 16 & 32\\
+每线程 Global 输入 float & $4+4$ & $8+8$\\
+每线程 Shared 逻辑读取 float & $16(4+4)=128$ & $16(8+4)=192$\\
+每线程乘加次数 & 256 & 512\\
+整个 Block Shared 逻辑读取 float & 32768 & 24576\\
+整个 Block 乘加次数 & 65536 & 65536\\\bottomrule
+\end{tabular}
+\caption{Shared 数量按源码标量操作推导；广播、bank、编译优化会改变真实事务数。}
+\end{table}
+V6 每线程 Shared 读取\textbf{更多}，但每线程计算翻倍、线程数减半，所以相同 Block 工作量的逻辑读取总数减少 25\%。这体现更大的寄存器 tile 输入复用。不要只比较单线程读取量就判断版本优劣。
+\takeaway{线程数量减半后，每线程搬运和计算都增加；比较收益时要对齐整个 Block 的 64×64×16 工作量。寄存器和指令的真实资源数据仍需编译与 profiling。}
+\pagebreakhere
+
+\subsection{此映射下 A 的 padding 有何作用}
+固定 i,k 时，32 个 lane 分成四个 laneRow 组，每组 8 个线程广播一个 A 地址。四行连续，stride=16 时 bank 序号形如 $b,b+16,b,b+16$（模 32），不同的第 0/2 行、第 1/3 行撞 bank；stride=17 时四行形如 $b,b+17,b+2,b+19$，四种地址落入不同 bank。这里的 \code{+1} 对这类计算读取有明确的分散作用。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1cm,y=0.95cm]
+\node[lbl] at (2,3.2) {以 Warp 0，i=0，k=0 为例};
+\node[lbl] at (6.6,3.2) {stride=16};
+\node[lbl] at (10.5,3.2) {stride=17};
+\foreach \r/\lanes/\b in {0/0--7/0,1/8--15/16,2/16--23/0,3/24--31/16} {
+\node[box,text width=3.6cm,minimum height=0.65cm] (row\r) at (2,2-\r) {lane \lanes\quad A[\r][0]};
+\node[warnbox,text width=1.8cm,minimum height=0.65cm] (bank\r) at (6.6,2-\r) {bank \b};
+\draw[arrow] (row\r)--(bank\r);
+}
+\foreach \r/\b in {0/0,1/17,2/2,3/19} {
+\node[calcbox,text width=1.8cm,minimum height=0.65cm] at (10.5,2-\r) {bank \b};
+}
+\draw[Orange,thick] (7.8,2)--(8.1,2)--(8.1,0)--(7.8,0);
+\draw[Orange,thick] (7.8,1)--(8.5,1)--(8.5,-1)--(7.8,-1);
+\node[lbl,text width=4cm] at (6.6,-2.2) {不同 A 地址落入同 bank\\形成两路冲突};
+\node[lbl,text width=3.3cm] at (10.5,-2.2) {四个不同地址分散开\\每组内部仍可广播};
+\end{tikzpicture}
+\caption{这里只分析计算阶段的一次 float 标量 Shared 读取。padding 对加载/存储阶段还需要分别分析。}
+\end{figure}
+
+\textbf{为什么同样的结论不能直接套用 V2？}V2 的 Warp 跨两个 threadIdx.y，每组 16 线程广播一个 A 地址；stride=16 时两种地址已落入不同 bank。V6 有四种连续行地址，stride=16 才出现上述两路碰撞。可见冲突取决于\textbf{布局与 lane 映射的组合}，不是仅取决于数组第二维。
+
+\textbf{为什么 B 保持 64 列？}固定 j,k 时，八种 laneCol 对应八个连续列，每个列地址被四个 laneRow 组重复请求；八个不同地址落不同 bank，重复同址可以广播。它不是“沿一列跨 64 行”的访问，所以不能看到 stride=64 就断言此处有 32 路冲突。
+
+\textbf{代价：}每线程 accum 从 16 到 32，寄存器生存量增大；Warp 数少了，调度器可切换的工作也可能减少。目标是更高的有效计算效率，不是保证 Occupancy 最大或速度一定更高。
+\pagebreakhere
+
+\section{V7：Tensor Core——用 WMMA 做矩阵块乘加}
+\subsection{这一步改变了计算单元，也改变了输入精度}
+V0--V6 用 FP32 输入，源码中是标量乘加。V7 用 \code{__half} 保存 A/B，以 FP32 累加和输出，通过 \code{nvcuda::wmma} 调用 Tensor Core 路径。它不是严格 FP32 等价实现，也不是 TF32 实现。
+
+Block 仍是 64×64、BK=16，4 个 Warp 各管 32×32。每个 Warp 的 32×32 输出再拆成四个 16×16 accumulator fragments：
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.75cm,y=0.75cm]
+\draw[Blue,thick,fill=PaleBlue] (0,0) rectangle (6.4,6.4);
+\draw[Blue,thick] (3.2,0)--(3.2,6.4);\draw[Blue,thick] (0,3.2)--(6.4,3.2);
+\node[lbl] at (1.6,4.8) {Warp 0};\node[lbl] at (4.8,4.8) {Warp 1};
+\node[lbl] at (1.6,1.6) {Warp 2};\node[lbl] at (4.8,1.6) {Warp 3};
+\node[lbl] at (3.2,7.1) {Block 64×64};
+\draw[Green,fill=PaleGreen,thick] (9,1.6) rectangle (15.4,8);
+\draw[Green,thick] (12.2,1.6)--(12.2,8);\draw[Green,thick] (9,4.8)--(15.4,4.8);
+\node[lbl] at (10.6,6.4) {accum[0][0]\\16×16};
+\node[lbl] at (13.8,6.4) {accum[0][1]\\16×16};
+\node[lbl] at (10.6,3.2) {accum[1][0]\\16×16};
+\node[lbl] at (13.8,3.2) {accum[1][1]\\16×16};
+\node[lbl] at (12.2,0.9) {放大一个 Warp 的 32×32 区域};
+\draw[arrow] (6.4,4.8)--(9,4.8);
+\end{tikzpicture}
+\caption{一个 Warp 持有四个逻辑 16×16 fragment，它们的实际存储分散在 32 个 lane 中。}
+\end{figure}
+
+\caution{\code{fragment} 不是“每个线程独自拥有一整块 16×16 数据”。它是 Warp 协作的矩阵片段表示，矩阵元素到 lane/寄存器的精确对应关系未由 WMMA API 规定\cite{wmma}。不能把 V6 的 8×4 私有输出坐标套到 V7。}
+
+每个 Warp 每 K tile 做四次逻辑 $16\times16\times16$ 的 \code{mma_sync} 调用，覆盖 32×32×16 的乘加；\textbf{API 调用次数不等于最终 Tensor Core 机器指令条数}。
+\pagebreakhere
+
+\subsection{WMMA 的四个关键 API 与实际指针}
+\src{versions/v7_tensor_core.cu}{44--56、109--130}
+\lstinputlisting[firstline=109,lastline=130,firstnumber=109]{versions/v7_tensor_core.cu}
+\noindent\begin{tabularx}{\linewidth}{lX}
+\toprule
+API & 本版本做的事\\\midrule
+\code{fill_fragment(accum,0)} & 四个输出片段初始化为 0；位于 K tile 循环外\\
+\code{load_matrix_sync} & 从 Shared 分别加载两个 16×16 的 A 片段和两个 16×16 的 B 片段\\
+\code{mma_sync(D,A,B,C)} & Warp 协作计算矩阵片段 $D=A\times B+C$；这里 D 与 C 使用同一 accum\\
+\code{store_matrix_sync} & 按行主序把完整 16×16 输出片段存到 Global 或 Shared\\\bottomrule
+\end{tabularx}
+
+\textbf{A 片段位置：}行起点 \code{warpRow*32 + i*16}，列起点 0；Shared A 一整行有 16 个 half，所以 leading dimension（ldm）是 16。\textbf{B 片段位置：}行起点 0，列起点 \code{warpCol*32 + j*16}；Shared B 一整行有 64 个 half，所以 ldm 是 64。
+
+\textbf{ldm 不是片段边长。}从一个 16×16 的 B 子块的一行跳到下一行，仍然必须跨 Shared B 的 64 个元素；写 16 会读错行。两个输入片段在固定 K tile 内配对，$2\times2$ 次 mma 更新四个输出片段。
+
+\subsection{Warp collective 与对齐要求}
+同一 Warp 的参与线程必须以一致的片段参数协作调用这些 API；不能让部分 lane 随意跳过一次 \code{mma_sync}。Shared 起点声明为 32 字节对齐。WMMA load/store 要求基址 256 bit（32 字节）对齐，half 的 ldm 是 8 的倍数，float 的 ldm 是 4 的倍数\cite{wmma}；这里 16/64 的 half stride 满足要求。
+\pagebreakhere
+
+\subsection{输入搬运：V7 现在不是向量化异步加载}
+\src{versions/v7_tensor_core.cu}{33--35、60--89}
+\code{tileA[64][16]}、\code{tileB[16][64]} 各 1024 个 half，128 个线程用标量循环协作加载，每线程搬 $1024/128=8$ 个 A 和 8 个 B。越界补 half 的 0，加载后 Block barrier，再开始 WMMA，计算后再 barrier 防止下一轮覆盖。
+
+\textbf{它保留了 Warp 输出分块，但没有保留 V3 的 float4 或 V5 的 cp.async。}因此 V7 不只是“前面一切都不变，把 FMA 换成 Tensor Core”。后续可以研究 half 向量加载、异步搬运和更好的共享布局，再逐项验证组合收益。
+
+\subsection{为什么写回有两条路径}
+\src{versions/v7_tensor_core.cu}{140--195}
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm and 8mm]
+\node[calcbox,text width=4cm] (a) {四个 Warp 的 accum fragments};
+\node[warnbox,below=of a,text width=6cm] (cond) {C 的 64×64 Block 完全在边界内\\且 N\%4==0？};
+\node[box,below left=10mm and 1mm of cond,text width=4.6cm] (yes) {是：store\_matrix\_sync\\直接写 Global C，ldm=N};
+\node[box,below right=10mm and 1mm of cond,text width=4.6cm] (no) {否：先写 Shared outputTile\\ldm=64，再 Block barrier};
+\node[box,below=of no,text width=4.6cm] (out) {全 Block 用标量读取 outputTile\\仅写 row<M 且 col<N 的 C};
+\draw[arrow] (a)--(cond);\draw[arrow] (cond)--(yes);\draw[arrow] (cond)--(no);\draw[arrow] (no)--(out);
+\end{tikzpicture}
+\caption{WMMA 写完整片段，边界不能靠单 lane 屏蔽来等价处理，因此用中间 Shared tile 安全裁剪。}
+\end{figure}
+直接写回要求全 tile 在边界内，避免整片段越界；N\%4 保证 float 的 ldm 条件。C 的起始地址和每个 16×16 片段起点也保持 32 字节对齐。边缘/非合适 stride 时则写到 64 列对齐的 Shared，再标量安全裁剪。
+
+\textbf{资源细节：}\code{outputTile[64][64]} 是静态声明，大小 16 KiB。即使 1024³ 的内部 tile 全部走直接路径，也不能把本 kernel 的静态 Shared 只算成 A/B 的 4 KiB；当前声明总计\textbf{20 KiB}。实际资源应再由编译属性确认。
+\pagebreakhere
+
+\subsection{FP16 输入 + FP32 累加为什么仍会有误差}
+在共同框架中，V7 使用 \code{runVersion<__half>}，转换函数为 \code{__float2half(value)}；A/B 在\textbf{主机准备阶段}就先舍入成 half，然后复制到 GPU。FP32 累加不能恢复转换时已丢失的输入有效位。
+
+用 $A_h=A+\Delta A$、$B_h=B+\Delta B$ 表示 half 量化，则忽略计算舍入时
+\[
+A_hB_h-AB=A\Delta B+\Delta A B+\Delta A\Delta B.
+\]
+此外，不同计算顺序也会导致浮点累加舍入差异。当前 reference 用\textbf{原始 FP32 A/B}，所以 V7 的误差包含输入量化与算法累加的综合影响，而不是仅比较 Tensor Core 对量化输入的计算误差。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm and 8mm]
+\node[box,text width=3.3cm] (in) {原始 FP32 A/B};
+\node[box,above right=5mm and 9mm of in,text width=3.9cm] (ref) {原始 FP32 输入\\GPU referenceGemm};
+\node[calcbox,below right=5mm and 9mm of in,text width=3.9cm] (tc) {先转 FP16 输入\\Tensor Core，FP32 accum};
+\node[warnbox,right=16mm of in,text width=2.2cm,xshift=5.5cm] (e) {对比输出\\Max abs error};
+\draw[arrow] (in)--(ref);\draw[arrow] (in)--(tc);\draw[arrow] (ref)--(e);\draw[arrow] (tc)--(e);
+\end{tikzpicture}
+\caption{现有比较包含输入精度变化。若要分离因素，可另算“half 舍入后再转 float”的 FP32 参考，但项目当前并未这样做。}
+\end{figure}
+
+V0--V6 默认最大绝对误差容差为 $10^{-3}$，V7 显式设为 $10^{-2}$。这些阈值是当前测试策略，不代表适用于任意数据范围、任意 K 的数值保证。较大值、长点积、抵消和非有限值都需要额外测试。
+
+\subsection{与 cuBLAS 对比时必须对齐模式}
+cuBLAS 是 NVIDIA 的 GPU BLAS 库，提供优化的矩阵运算及不同数据/计算模式\cite{cublas}。严格 FP32、TF32 和 FP16 Tensor Core 有不同输入/计算模式；V7 是 FP16 输入、FP32 累加，不能把其速度直接当成严格 FP32 GEMM 的同精度胜负。\textbf{同形状、同布局、同精度策略、同计时范围}才是公平对比。
+
+\takeaway{V7 引入 Warp collective 的矩阵块计算，并降低输入精度。它展示 Tensor Core 的使用方式，不证明当前教学 kernel 达到 cuBLAS 的性能或数值能力。}
+\pagebreakhere
+
+\section{共同 benchmark：输入、reference、预热和计时}
+\subsection{八个版本为什么可以共用一套框架}
+\src{include/gemm_benchmark.cuh}{26--30、77--108、110--260}
+\code{runVersion<InputType>} 把输入类型和 launch 函数作为可替换部分，其余流程保持一致。V0--V6 输入是 float，convert 为恒等映射；V7 输入是 half，convert 为 float→half。C/reference 均为 float。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=5mm]
+\node[box,text width=11cm] (a) {生成原始 FP32 主机 A/B；转换为版本所需 InputType};
+\node[box,below=of a,text width=11cm] (b) {cudaMalloc；复制输入；另保留原始 FP32 GPU reference 输入};
+\node[box,below=of b,text width=11cm] (c) {运行 GPU referenceGemm，并同步};
+\node[warnbox,below=of c,text width=11cm] (d) {当前版本预热 5 次，然后 cudaDeviceSynchronize};
+\node[calcbox,below=of d,text width=11cm] (e) {CUDA Event start → 连续 launch 20 次 → Event stop → 等完成};
+\node[box,below=of e,text width=11cm] (f) {总毫秒数 / 20；复制结果；计算误差；释放 GPU 资源};
+\draw[arrow] (a)--(b);\draw[arrow] (b)--(c);\draw[arrow] (c)--(d);\draw[arrow] (d)--(e);\draw[arrow] (e)--(f);
+\end{tikzpicture}
+\caption{计时区间只覆盖第 e 步。reference 是 GPU naive kernel，不是 CPU 计算，也不是 cuBLAS。}
+\end{figure}
+
+\textbf{预热的作用：}避免首次 launch、初始化、潜在 JIT 和初始缓存/频率状态过度影响短 kernel 的稳定时间。它是降低干扰的方法，不保证 5 次足以让所有硬件进入完全相同的稳态。
+
+主机调用 \code{kernel<<<...>>>} 通常是异步提交，默认 stream 中的操作有先后顺序；Event 会在对应位置记录 GPU 时间。\textbf{主机异步 launch 与 V5 在 kernel 内部的异步拷贝是两种不同层面的异步。}
+\pagebreakhere
+
+\subsection{嵌套 lambda 如何参与计时}
+\begin{lstlisting}[numbers=none]
+float elapsedMs = [&]() {
+    auto launchCurrentVersion = [&]() {
+        launch(dA, dB, dC, M, N, K);
+    };
+    return benchmarkKernel(launchCurrentVersion);
+}();
+\end{lstlisting}
+内层 lambda 把带参数的 launch 包装成\textbf{零参数回调}，框架便能反复调用而不必知道参数类型。\code{[&]} 按引用捕获作用域里的变量；外层 lambda 定义后立刻通过末尾 \code{()} 调用，把返回的平均毫秒数赋给 elapsedMs。它不表示自动开线程、不表示新的 CUDA stream，也不负责实现计算访存重叠。
+
+\subsection{时间和 GFLOPS 的含义}
+当前固定 $M=N=K=1024$，warmup=5，repeat=20。性能计算为
+\[
+\mathrm{GFLOPS}=\frac{2MNK}{\mathrm{elapsedMs}\times10^6}.
+\]
+1024³ 约有 $2.147\times10^9$ FLOP；如果 kernel 平均 1 ms，则约为 2147 GFLOPS。这里\textbf{不包含}主机输入生成、类型转换、显存分配、Host$\leftrightarrow$Device 拷贝、reference 和结果校验，因此这是 kernel-only throughput，不是整个应用的端到端吞吐。
+
+\subsection{正确性输出怎么读}
+框架复制 C 与 reference 回主机，计算最大绝对差 $\max|C-C_{ref}|$，并与容差做严格小于比较。打印成 0.000000 可能只是显示舍入，不说明逐 bit 一致。
+
+进一步完善验证时，应覆盖随机/非周期输入、正负值、矩形、非 tile 整数倍、不同 K、极端数值，并显式检查 NaN/Inf。现有简单最大误差及固定周期输入不是全面验证：例如 \code{fmax} 的非有限值处理可能让仅靠最大误差的判断不够可靠。
+
+\caution{本次只生成源码解释 PDF，没有运行新的一轮 V0--V7 数值或性能实验。文中“应该做哪些测试”是验证建议，不应理解为这些测试已执行通过。}
+\pagebreakhere
+
+\section{从结构优化到性能解释：不要只看一个指标}
+\subsection{先看每轮实际改变了什么}
+\begin{longtable}{p{0.8cm}p{4.5cm}p{4.5cm}p{4.3cm}}
+\toprule
+版本 & 相对前一阶段的新机制 & 主要收益来源 & 主要代价/限制\\\midrule
+\endhead
+V0 & 单线程单输出，直接遍历 K & 简单易验证 & 重复请求、多输出独立性不足\\
+V1 & 16×16 A/B Shared tile & Block 级输入复用 & barrier 和 Shared 指令\\
+V2 & 64×64 输出；每线程 4×4 外积 & 更大 Block tile；寄存器输入复用 & 更多 accum、Shared、寄存器压力\\
+V3 & 一线程一组 A/B float4 & 宽加载与更少指令的机会 & 对齐与尾部回退；字节数不降\\
+V4 & 两套 Shared，寄存器提前取下一块 & 独立指令预取、可能隐藏延迟 & Shared 翻倍，预取寄存器生存期\\
+V5 & Global→Shared cp.async，延后 wait & 显式异步流水线；不经输入暂存寄存器 & sm\_80+、对齐、线程组等待语义\\
+V6 & 四个 32×32 Warp tile，8×4 Thread tile & 相同计算量的 Shared 逻辑读取减少 & 累加器翻倍；未保留异步/双缓冲\\
+V7 & 四个 fragment/Warp，FP16 Tensor Core & 矩阵块硬件吞吐与输入字节减少 & 精度改变；20 KiB Shared；未组合流水线\\\bottomrule
+\end{longtable}
+
+\subsection{Roofline 可以帮助判断什么}
+对 $BM\times BN\times BK$ 一个 K 段，忽略输出、边缘填充、缓存与重载，只算理想输入 tile 的 arithmetic intensity：
+\[
+I_{\mathrm{tile}}=\frac{2BM\,BN\,BK}{s(BM\,BK+BK\,BN)}
+=\frac{2BM\,BN}{s(BM+BN)},
+\]
+其中 s 是输入每元素字节数。V1 为 4 FLOP/B，V2--V6 为 16 FLOP/B，V7（half 输入）为 32 FLOP/B。V3--V6 的 tile 形状和输入字节数相同，所以\textbf{这一个理想强度值不能反映向量指令、异步时序和 Warp 布局的收益}。
+
+\caution{这组强度值是源码模型，不是 NCU 实测 Roofline 点。真正的 DRAM/L2 流量还受跨 tile 缓存、输入重载、C 写回及其他事务影响；FP32 和 Tensor Core 又有不同计算屋顶。不能凭“32 FLOP/B”断言 V7 一定 compute-bound。}
+\pagebreakhere
+
+\subsection{寄存器、Shared、Occupancy 与 Stall 的关系}
+Occupancy 是驻留 active warps 相对 SM 最大 Warp 容量的比例，不是计算单元忙碌率。设每 SM 可驻留 Block 数为 $B_{active}$，每 Block warp 数为 $W_{block}$，SM 最大 warp 数为 $W_{max}$，则理论值近似
+\[
+O_{theory}=\frac{B_{active}W_{block}}{W_{max}}.
+\]
+$B_{active}$ 同时受寄存器、Shared、线程数、Block 限额和分配粒度限制。应通过 CUDA Occupancy API、kernel attributes 或 NCU 获取，而不是只用 Shared 大小除 SM 容量。对应查询函数为：
+\begin{lstlisting}[numbers=none]
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(...);
+\end{lstlisting}
+
+较高 Occupancy 有助于切换其他 Warp 隐藏延迟，但较大的寄存器 tile 也能减少输入指令、提高独立工作量。\textbf{低一些的 Occupancy 配合更多有效复用，仍可能更快。}相反，过大 tile 可能引发 register spill，访问 local memory，严重抵消收益。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=6mm and 8mm]
+\node[box,text width=4.4cm] (tile) {更大的寄存器 tile};
+\node[calcbox,below left=8mm and 4mm of tile,text width=4.4cm] (reuse) {输入复用提高、累加器更多\\可能有更多独立乘加};
+\node[warnbox,below right=8mm and 4mm of tile,text width=4.4cm] (reg) {每线程寄存器需求增加\\可能限制同驻 Block 或 spill};
+\node[box,below=22mm of tile,text width=6cm] (result) {总时间取决于有效工作与资源限制的平衡\\不是把某一个百分比最大化};
+\draw[arrow] (tile)--(reuse);\draw[arrow] (tile)--(reg);\draw[arrow] (reuse)--(result);\draw[arrow] (reg)--(result);
+\end{tikzpicture}
+\caption{参数调优需要性能测量；合理结构并不自动等于最快参数。}
+\end{figure}
+
+\subsection{怎样解释常见 Warp Stall}
+Long Scoreboard 可提示 Global/L1/L2 等长延迟依赖；Short Scoreboard 常与片上/Shared 等短延迟依赖有关；Barrier 指向线程同步等待；MIO Throttle 可提示相关指令管线压力；Math Pipe Throttle 与计算管线竞争有关。\textbf{这些是排查方向，不是单独就能确定根因的诊断。}应联合指令、事务、带宽和执行时间，且具体定义以所用 NCU 版本为准\cite{ncu}。
+\pagebreakhere
+
+\section{如何复现与核对这些机制}
+\subsection{构建及运行八个独立版本}
+在项目根目录运行：
+\begin{lstlisting}[language=bash,numbers=none]
+make versions
+./bin/v0_naive
+./bin/v1_shared_memory
+./bin/v2_register_tiling
+./bin/v3_vectorized_load
+./bin/v4_double_buffer
+./bin/v5_cp_async
+./bin/v6_warp_tiling
+./bin/v7_tensor_core
+\end{lstlisting}
+Makefile 当前默认包含 sm\_75、sm\_80 机器码与 compute\_80 PTX。若使用项目原实验的 RTX 4060，可显式生成 sm\_89：
+\begin{lstlisting}[language=bash,numbers=none]
+make -B versions GENCODE_FLAGS="-gencode arch=compute_89,code=sm_89"
+\end{lstlisting}
+使用 \code{-B} 是为了已有二进制存在时也按新目标重编译，因为 Make 不一定跟踪命令行 flag 的变化。具体目标仍需和实际 GPU、CUDA 编译器匹配。V5 需要 sm\_80+，V7 需要 sm\_70+；出现 SKIPPED 要同时检查设备能力与编译目标。
+
+\subsection{检查向量指令、异步指令和寄存器资源}
+\begin{lstlisting}[language=bash,numbers=none]
+make -B versions NVCC_FLAGS="-O3 -std=c++17 -lineinfo -Xptxas=-v"
+cuobjdump --dump-sass ./bin/v3_vectorized_load
+cuobjdump --dump-sass ./bin/v5_cp_async
+cuobjdump --dump-sass ./bin/v7_tensor_core
+\end{lstlisting}
+ptxas 输出可以核对编译目标对应的寄存器、Shared 和 spill；多架构构建会输出多份，必须看实际执行的那份。SASS 中检查宽加载、异步拷贝和矩阵乘加类别；具体助记符随架构/工具版本变化，不要要求它和内联 PTX 字符串逐字相同。
+
+\subsection{记录性能时保持一致}
+保持相同 GPU、电源/频率条件、矩阵规模、输入、预热/重复策略及计时区间。FP32 V0--V6 与 FP16 V7 分组呈现。小矩阵可能由 launch/边界开销主导，大矩阵也未必只由 DRAM 带宽主导。
+\pagebreakhere
+
+\subsection{Nsight Compute 在此处可以怎样用}
+以下是\textbf{可复现命令示例，本文生成时未执行 profiling}。独立程序中只有一个目标版本，仍用 kernel 名过滤，避免把 referenceGemm 误当成目标。
+\begin{lstlisting}[language=bash,numbers=none]
+.tools/nsight-compute-current/ncu \
+  --kernel-name-base function \
+  --kernel-name gemmWarpTiled \
+  --launch-skip 5 --launch-count 1 \
+  --set basic \
+  -o profiles/v6_warp_basic \
+  ./bin/v6_warp_tiling
+\end{lstlisting}
+\code{--launch-skip 5} 跳过\textbf{匹配目标过滤器}的前五次 launch，对应框架 warmup；\code{--launch-count 1} 只采样下一次。过滤器已限定 gemmWarpTiled，因此前面 reference launch 不被算进这五次\cite{ncucli}。采样可能需要 replay，不能拿 profiling 后的运行时间替代正常 benchmark 时间\cite{ncu}。
+
+进一步采集完整报告：
+\begin{lstlisting}[language=bash,numbers=none]
+.tools/nsight-compute-current/ncu \
+  --kernel-name-base function \
+  --kernel-name gemmCpAsyncDoubleBuffered \
+  --launch-skip 5 --launch-count 1 \
+  --set full \
+  -o profiles/v5_async_full \
+  ./bin/v5_cp_async
+\end{lstlisting}
+Full 采集成本更高，建议在稳定 benchmark 后挑有代表性的版本。若报权限或 Sections 路径问题，先处理工具配置，不应把失败采集当成性能结论。
+
+\noindent\begin{tabularx}{\linewidth}{lX}
+\toprule
+对比 & 优先查看的问题\\\midrule
+V0 → V1 & 全局加载/缓存事务如何变化？增加多少 Shared 指令和同步？\\
+V1 → V2 & 寄存器与 Shared 是否限制驻留？更多累加器是否提高有效吞吐？\\
+V2 → V3 & 宽加载是否实际生成？指令数和事务效率是否改善？\\
+V3 → V4 → V5 & 等待型 stall/时间是否下降？双缓冲是否降低同驻 Block？\\
+V3 → V6 & Shared 读取和 bank conflict 是否变化？32 个 accum 是否带来 spill？\\
+V6 → V7 & Tensor Core 指令是否执行？输入/输出/Shared 搬运是否成为新的瓶颈？\\\bottomrule
+\end{tabularx}
+
+\caution{NCU 给出的计数器可以支持“瓶颈是否变化”的判断，但单个 stall 百分比或单张 Roofline 图不能直接证明 V5 每一条拷贝与计算都完全重叠。结合源码依赖、SASS 和对照实验判断。}
+\pagebreakhere
+
+\section{常见疑问：把几个容易混淆的概念分开}
+\subsection*{BK 就是一次做乘法的次数吗？}
+对\textbf{每一个输出}，一轮 BK=16 提供 16 项乘加；对整个线程，V2 一轮做 $16\times16=256$ 次乘加，因为它有 16 个输出。BK 不是 Block 总共乘法的次数，也不是输出宽度。
+
+\subsection*{每个线程到底读 4 个还是 16 个 A？}
+先问读哪一层：V2 每 K tile 从 Global 协作搬 4 个 A；每个 k 从 Shared 取 4 个 A，共 16 个 k，即 64 次 A 标量读取。每个输出沿 K 使用 16 个 A。三句话同时成立。
+
+\subsection*{4 个 A、4 个 B 为什么足够更新 16 个输出？}
+固定 k 时，四行×四列形成 16 组配对；每个输出只更新一项。重复 k=0--15，再对后续 tileK 重复，才得到完整 K 项点积。不是只算四次乘法，也不是一个输出只算四项。
+
+\subsection*{V3 是否把 regA/regB 的四个值变连续了？}
+不是。V3 连续化的是\textbf{单线程 Global float4 加载}。Shared→regA 的输出行、Shared→regB 的输出列和 V2 一样，步长仍为 16。
+
+\subsection*{有两套数组就等于异步吗？}
+不是。双缓冲解决“当前块和下一块互不覆盖”的空间问题；预取/异步拷贝与延迟消费解决“什么时候发起，什么时候等待”的时序问题。V4 是普通加载预取，V5 是显式 cp.async。
+
+\subsection*{wait 后才计算，不还是顺序吗？}
+启动第一块确实先 wait 再算；稳态循环却是\textbf{发起下一块 → 算当前块 → 等下一块}。重叠窗口在“发起”和“等待”之间。下一块若没完成，wait 只等待剩余延迟。
+
+\subsection*{Warp Tiling 是用了新的计算指令吗？}
+V6 没有；仍是标量寄存器外积。新的是 Warp/lane 责任分工与复用组织。V7 才通过 WMMA 引入矩阵块计算硬件。
+
+\subsection*{下一步可以怎样组合优化？}
+在统一精度和验证策略下，组合 V6 的 Warp 映射与 V5 的异步双缓冲，再研究向量输出、bank-friendly layout、BM/BN/BK/TM/TN 参数搜索。V7 可研究 half 向量搬运与异步流水线；这些\textbf{不在当前八个版本中自动存在}。
+\pagebreakhere
+
+\section{源码索引与参考资料}
+\subsection{按机制快速找到关键实现}
+\begin{longtable}{p{4.4cm}p{6.6cm}p{2.8cm}}
+\toprule
+要找的内容 & 文件 & 行号\\\midrule
+\endhead
+一个输出的完整点积 & \code{versions/v0_naive.cu} & 11--25\\
+Shared 加载与两次同步 & \code{versions/v1_shared_memory.cu} & 22--44\\
+BK / TM / TN 定义 & \code{versions/v2_register_tiling.cu} & 3--9\\
+标量协作搬 tile & \code{versions/v2_register_tiling.cu} & 28--55\\
+regA / regB 外积 & \code{versions/v2_register_tiling.cu} & 59--81\\
+分散输出地址 & \code{versions/v2_register_tiling.cu} & 86--97\\
+float4 reader 与回退 & \code{versions/v3_vectorized_load.cu} & 11--35\\
+向量行列分工 & \code{versions/v3_vectorized_load.cu} & 53--87\\
+提前加载 nextA / nextB & \code{versions/v4_double_buffer.cu} & 81--105\\
+计算之后写 nextBuffer & \code{versions/v4_double_buffer.cu} & 131--143\\
+cp.async 内联 PTX & \code{versions/v5_cp_async.cu} & 36--72\\
+commit / wait helper & \code{versions/v5_cp_async.cu} & 74--85\\
+issue → compute → wait & \code{versions/v5_cp_async.cu} & 138--193\\
+Warp/lane 坐标 & \code{versions/v6_warp_tiling.cu} & 54--62\\
+128 线程向量搬运 & \code{versions/v6_warp_tiling.cu} & 66--116\\
+8×4 寄存器外积 & \code{versions/v6_warp_tiling.cu} & 120--151\\
+WMMA accumulator 声明 & \code{versions/v7_tensor_core.cu} & 44--56\\
+WMMA load / mma & \code{versions/v7_tensor_core.cu} & 91--130\\
+直接或 Shared 裁剪写回 & \code{versions/v7_tensor_core.cu} & 140--195\\
+输入、reference 与计时 & \code{include/gemm_benchmark.cuh} & 全文件\\\bottomrule
+\end{longtable}
+
+\pagebreakhere
+\subsection{官方参考}
+源码解释以项目当前文件为准；以下资料用于核对 bank、异步指令、Warp collective 与 profiling 等规则。在线文档会更新，访问日期为 2026-09-14。
+\begin{thebibliography}{9}
+\bibitem{ptx} NVIDIA. \textit{Parallel Thread Execution ISA}.\\
+\url{https://docs.nvidia.com/cuda/parallel-thread-execution/index.html}
+\bibitem{best} NVIDIA. \textit{CUDA C++ Best Practices Guide: Shared Memory and Memory Banks}.\\
+\url{https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-and-memory-banks}
+\bibitem{wmma} NVIDIA. \textit{CUDA C++ Programming Guide: Warp Matrix Functions}.\\
+\url{https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#warp-matrix-functions}
+\bibitem{ncu} NVIDIA. \textit{Nsight Compute Profiling Guide}.\\
+\url{https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html}
+\bibitem{ncucli} NVIDIA. \textit{Nsight Compute CLI: Profile Options}.\\
+\url{https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html}
+\bibitem{cublas} NVIDIA. \textit{cuBLAS Library Documentation}.\\
+\url{https://docs.nvidia.com/cuda/cublas/index.html}
+\end{thebibliography}
+
+\vspace{0.4cm}
+\takeaway{V0--V7 的主线：明确输出责任 → Block 共享复用 → 寄存器外积复用 → 宽加载 → 预取/异步流水线；另一方向是 Warp 分工 → Tensor Core。最终仍以数值正确性、正常计时和硬件证据共同判断优化是否有效。}
+\end{document}

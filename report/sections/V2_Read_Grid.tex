@@ -1,0 +1,17 @@
+\subsection{网格图：四条 A 行、四条 B 列，交叉得到 16 个输出}
+和 V1 的“单行 A×单列 B”图一样，这里展示\textbf{计算时从 Shared 读取的范围}，不是 Global 协作加载的分工。继续看线程 $(x,y)=(3,2)$：四条 A 行与四条 B 列固定，所有读取共同改变 k。
+\begin{figure}[H]\centering
+\input{report/figures/V2_Shared_Read_Grid.tikz}
+\caption{浅橙条带是该线程遍历的 A 行/B 列，深橙格是 k=6 的输入与被更新的输出。行号从上向下增加、列号从左向右增加，均从 0 开始。三幅图按各自维度缩放；每格仍是一个元素。A 的 padding 列不画入逻辑网格。}
+\end{figure}
+固定任意 k，同一线程执行
+\[
+accum[i][j]\mathrel{+}=tileA[2+16i][k],tileB[k][3+16j],\quad i,j=0,1,2,3.
+\]
+例如图中本地 $C[18,35]$ 对应 $accum[1][2]$：k=6 时只加 $tileA[18][6]\times tileB[6][35]$；k 从 0 走到 15 后，才完成
+\[
+\Delta C[18,35]=\sum_{k=0}^{15}tileA[18][k],tileB[k][35].
+\]
+若沿用 Block 起点 $(64,128)$，它就是全局 $C[82,163]$。图中其他 15 个橙色输出也都各自得到完整的 16 项贡献；绿色条带中未标橙的元素由其他线程负责。
+\takeaway{V1 是 1 行×1 列，V2 是 4 行×4 列。每个输出仍做 16 项点积，只是同一个线程用寄存器复用输入，同时更新更多输出。}
+\pagebreakhere

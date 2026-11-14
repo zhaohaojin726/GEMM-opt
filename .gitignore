@@ -1,0 +1,6 @@
+.tools/
+profiles/*.csv
+profiles/ncu
+profiles/nsys/*.nsys-rep
+profiles/nsys/*.sqlite
+report/build/

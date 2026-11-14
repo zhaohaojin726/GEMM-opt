@@ -1,0 +1,75 @@
+% Draw logical Shared reads and output ownership using actual matrix indices.
+% #1/#2: output rows/columns; #3/#4: selected row/column lists; #5: example k.
+% All three panels have equal visual size, but their cell aspect ratios differ.
+\newcommand{\GemmReadGrid}[5]{%
+  \pgfmathsetmacro{\panelSize}{4.4}
+  \pgfmathsetmacro{\aCellW}{\panelSize/16}
+  \pgfmathsetmacro{\aCellH}{\panelSize/#1}
+  \pgfmathsetmacro{\bCellW}{\panelSize/#2}
+  \pgfmathsetmacro{\bCellH}{\panelSize/16}
+  \begin{scope}
+    \fill[PaleBlue] (0,0) rectangle (\panelSize,\panelSize);
+    \foreach \r in {#3} {
+      \fill[Orange!30] (0,{\panelSize-(\r+1)*\aCellH})
+        rectangle (\panelSize,{\panelSize-\r*\aCellH});
+    }
+    \foreach \r in {0,...,#1} {
+      \draw[gray!40,line width=0.15pt] (0,{\r*\aCellH})--(\panelSize,{\r*\aCellH});
+    }
+    \foreach \c in {0,...,16} {
+      \draw[gray!40,line width=0.15pt] ({\c*\aCellW},0)--({\c*\aCellW},\panelSize);
+    }
+    \foreach \r in {#3} {
+      \draw[thinarr,line width=0.45pt] (0.08,{\panelSize-(\r+0.5)*\aCellH})
+        --(4.31,{\panelSize-(\r+0.5)*\aCellH});
+      \filldraw[fill=Orange,draw=Orange!70!black,line width=0.35pt]
+        ({#5*\aCellW},{\panelSize-(\r+1)*\aCellH})
+        rectangle ({(#5+1)*\aCellW},{\panelSize-\r*\aCellH});
+    }
+    \draw[Blue,thick] (0,0) rectangle (\panelSize,\panelSize);
+  \end{scope}
+  \begin{scope}[xshift=5.8cm]
+    \fill[PaleBlue] (0,0) rectangle (\panelSize,\panelSize);
+    \foreach \c in {#4} {
+      \fill[Orange!30] ({\c*\bCellW},0) rectangle ({(\c+1)*\bCellW},\panelSize);
+    }
+    \foreach \r in {0,...,16} {
+      \draw[gray!40,line width=0.15pt] (0,{\r*\bCellH})--(\panelSize,{\r*\bCellH});
+    }
+    \foreach \c in {0,...,#2} {
+      \draw[gray!40,line width=0.15pt] ({\c*\bCellW},0)--({\c*\bCellW},\panelSize);
+    }
+    \foreach \c in {#4} {
+      \draw[thinarr,line width=0.45pt] ({(\c+0.5)*\bCellW},4.31)
+        --({(\c+0.5)*\bCellW},0.08);
+      \filldraw[fill=Orange,draw=Orange!70!black,line width=0.35pt]
+        ({\c*\bCellW},{\panelSize-(#5+1)*\bCellH})
+        rectangle ({(\c+1)*\bCellW},{\panelSize-#5*\bCellH});
+    }
+    \draw[Blue,thick] (0,0) rectangle (\panelSize,\panelSize);
+  \end{scope}
+  \begin{scope}[xshift=11.6cm]
+    \fill[PaleGreen] (0,0) rectangle (\panelSize,\panelSize);
+    \foreach \r in {#3} {
+      \fill[Green!15] (0,{\panelSize-(\r+1)*\aCellH})
+        rectangle (\panelSize,{\panelSize-\r*\aCellH});
+    }
+    \foreach \c in {#4} {
+      \fill[Green!15] ({\c*\bCellW},0) rectangle ({(\c+1)*\bCellW},\panelSize);
+    }
+    \foreach \r in {0,...,#1} {
+      \draw[gray!40,line width=0.15pt] (0,{\r*\aCellH})--(\panelSize,{\r*\aCellH});
+    }
+    \foreach \c in {0,...,#2} {
+      \draw[gray!40,line width=0.15pt] ({\c*\bCellW},0)--({\c*\bCellW},\panelSize);
+    }
+    \foreach \r in {#3} {\foreach \c in {#4} {
+      \filldraw[fill=Orange,draw=Orange!70!black,line width=0.3pt]
+        ({\c*\bCellW},{\panelSize-(\r+1)*\aCellH})
+        rectangle ({(\c+1)*\bCellW},{\panelSize-\r*\aCellH});
+    }}
+    \draw[Green,thick] (0,0) rectangle (\panelSize,\panelSize);
+  \end{scope}
+  \node at (5.1,2.2) {$\times$};
+  \node at (10.9,2.2) {$\to$};
+}

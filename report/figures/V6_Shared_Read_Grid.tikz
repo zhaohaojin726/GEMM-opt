@@ -1,0 +1,10 @@
+\begin{tikzpicture}[x=1cm,y=1cm]
+\GemmReadGrid{32}{32}{1,5,9,13,17,21,25,29}{3,11,19,27}{6}
+\node[lbl,text width=4.7cm] at (2.2,5) {Shared tileA：前 32 行\\32×16};
+\node[lbl,text width=4.7cm] at (8,5) {Shared tileB：前 32 列\\16×32};
+\node[lbl,text width=4.7cm] at (13.8,5) {Warp 0 的 C：32×32\\本地行、列 0--31};
+\node[lbl,text width=4.7cm] at (2.2,-1) {固定八行：1、5、9、13、\\17、21、25、29\\k 沿各行从 0 走到 15};
+\node[lbl,text width=4.7cm] at (8,-1) {固定四列：3、11、19、27\\k 沿各列从 0 走到 15};
+\node[lbl,text width=4.7cm] at (13.8,-1) {只更新 8 行×4 列的交叉点\\共 32 个分散输出};
+\node[lbl,text width=16.2cm] at (8,-2.3) {V6：Warp 0 的 lane 11，laneRow=1、laneCol=3，深橙格示例为 k=6。\\每个 k：8 个 A、4 个 B 交叉配对，给 32 个 C 各增加一项。};
+\end{tikzpicture}

@@ -1,0 +1,487 @@
+\documentclass[UTF8,11pt,a4paper,fontset=fandol]{ctexart}
+\usepackage[a4paper,margin=2.05cm,headheight=15pt]{geometry}
+\usepackage[table]{xcolor}
+\usepackage{amsmath,amssymb,booktabs,tabularx,array,longtable}
+\usepackage{graphicx,float,tikz,listings,hyperref,fancyhdr,enumitem}
+\usetikzlibrary{arrows.meta,positioning,calc}
+
+\definecolor{Blue}{HTML}{245A8D}
+\definecolor{Green}{HTML}{447B24}
+\definecolor{Orange}{HTML}{C77A21}
+\definecolor{Red}{HTML}{A33A3A}
+\definecolor{PaleBlue}{HTML}{EAF2FA}
+\definecolor{PaleGreen}{HTML}{EDF5E8}
+\definecolor{PaleOrange}{HTML}{FFF3E4}
+\definecolor{CodeBg}{HTML}{F5F7FA}
+\definecolor{Ink}{HTML}{263342}
+
+\hypersetup{colorlinks=true,linkcolor=Blue,urlcolor=Blue,citecolor=Green,
+  pdftitle={CUDA GEMM 性能分析与 Nsight 使用指南},
+  pdfauthor={gemm-opt 项目}}
+\pagestyle{fancy}\fancyhf{}
+\lhead{CUDA GEMM 性能分析与 Nsight 使用指南}
+\rhead{gemm-opt}
+\cfoot{\thepage}
+\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{3em}
+\setlist{itemsep=0.2em,topsep=0.3em}
+\renewcommand{\arraystretch}{1.2}
+% detokenize keeps shell spaces visible while allowing underscores in paths.
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\takeaway}[1]{\par\noindent\colorbox{PaleBlue}{\parbox{\dimexpr\linewidth-2\fboxsep\relax}{\textbf{要点}\quad #1}}\par}
+\newcommand{\caution}[1]{\par\noindent\colorbox{PaleOrange}{\parbox{\dimexpr\linewidth-2\fboxsep\relax}{\textbf{注意}\quad #1}}\par}
+\newcommand{\pagebreakhere}{\clearpage}
+
+\lstdefinestyle{shell}{language=bash,basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{Blue},commentstyle=\color{Green!70!black},
+  backgroundcolor=\color{CodeBg},frame=single,rulecolor=\color{gray!25},
+  numbers=left,numberstyle=\tiny\color{gray},numbersep=7pt,
+  breaklines=true,columns=fullflexible,showstringspaces=false,tabsize=2}
+\lstdefinestyle{cuda}{language=C++,basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{Blue}\bfseries,commentstyle=\color{Green!70!black},
+  backgroundcolor=\color{CodeBg},frame=single,rulecolor=\color{gray!25},
+  numbers=left,numberstyle=\tiny\color{gray},numbersep=7pt,
+  breaklines=true,columns=fullflexible,showstringspaces=false,tabsize=4}
+\lstset{style=shell}
+\tikzset{stepbox/.style={draw=Blue,thick,rounded corners=2mm,fill=PaleBlue,
+  align=center,minimum width=3cm,minimum height=1cm,font=\small},
+  greenbox/.style={stepbox,draw=Green,fill=PaleGreen},
+  warnbox/.style={stepbox,draw=Orange,fill=PaleOrange},
+  arrow/.style={-{Latex[length=2.4mm]},thick,draw=Ink}}
+
+\begin{document}
+\begin{titlepage}
+\centering
+\vspace*{1.2cm}
+{\large\color{Blue}gemm-opt · CUDA 实践手册\par}
+\vspace{0.8cm}
+{\Huge\bfseries CUDA GEMM 性能分析与\par}
+\vspace{0.25cm}
+{\Huge\bfseries Nsight 使用指南\par}
+\vspace{1.1cm}
+\begin{tikzpicture}[node distance=8mm]
+\node[stepbox,minimum width=11cm] (a) {可重复计时：预热、CUDA Event、正确性校验};
+\node[stepbox,below=of a,minimum width=11cm] (b) {Nsight Systems：看时间线、Launch、CPU/GPU 关系};
+\node[greenbox,below=of b,minimum width=11cm] (c) {Nsight Compute：看带宽、Roofline、寄存器、Occupancy、Warp Stall};
+\node[warnbox,below=of c,minimum width=11cm] (d) {提出假设 → 改代码 → 重新计时 → 用指标验证};
+\draw[arrow] (a)--(b);\draw[arrow] (b)--(c);\draw[arrow] (c)--(d);
+\end{tikzpicture}
+\vfill
+\begin{minipage}{0.84\linewidth}\large
+本指南以本项目的 V0--V7、参数化 Auto-Tuning kernel 和 cuBLAS 对照为例，说明如何从“运行时间”定位到“硬件瓶颈”。命令默认在项目根目录执行。\par
+\textbf{核心原则：}先保证测量可信，再用 Systems 定位阶段，用 Compute 解释 kernel 内部原因；不要把单个指标直接当成优化结论。
+\end{minipage}
+\vfill
+{\large 2026 年 9 月 17 日\par}
+\end{titlepage}
+
+\tableofcontents
+\pagebreakhere
+
+\section{先建立正确的性能问题}
+性能分析不是“打开 NCU 看一个百分比”，而是一个闭环：
+\begin{enumerate}
+  \item 固定矩阵规模、数据类型、GPU、电源/频率和编译选项；
+  \item 用独立的 CUDA Event 计时，预热后重复多次；
+  \item 记录 GFLOPS、误差和配置，先确认快但正确；
+  \item 用 Nsight Systems 判断时间花在初始化、拷贝、launch 还是 kernel；
+  \item 用 Nsight Compute 针对一个 kernel 采集硬件计数器；
+  \item 根据证据提出一个改动，再用同一方法复测。
+\end{enumerate}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=8mm]
+\node[stepbox] (q) {问题：为什么慢？};
+\node[stepbox,right=of q] (t) {Event 计时\\确认差异};
+\node[stepbox,right=of t] (s) {nsys\\看时间线};
+\node[greenbox,below=of s] (n) {ncu\\看 kernel 内部};
+\node[greenbox,left=of n] (r) {Roofline /\\资源指标};
+\node[warnbox,left=of r] (h) {假设与改动};
+\draw[arrow] (q)--(t);\draw[arrow] (t)--(s);\draw[arrow] (s)--(n);\draw[arrow] (n)--(r);\draw[arrow] (r)--(h);
+\draw[arrow] (h.south) -- ++(0,-0.55) -| (t.south);
+\end{tikzpicture}
+\caption{推荐的性能分析闭环。}
+\end{figure}
+
+\takeaway{性能数字回答“有多快”，Systems 回答“时间花在哪里”，Compute 回答“这个 kernel 为什么这样快或慢”。}
+
+\section{项目准备与可重复计时}
+\subsection{编译和运行}
+项目把 V0--V7 拆成独立程序，参数化搜索程序是 \code{autotune_gemm}：
+\begin{lstlisting}[style=shell]
+# 在 /home/drink_ice/EDisk/gemm-opt 执行
+make versions                 # 编译 bin/v0_* 到 bin/v7_*
+make autotune                 # 编译 bin/autotune_gemm
+./bin/v0_naive
+./bin/v6_warp_tiling
+./bin/v7_tensor_core
+./bin/autotune_gemm --list-configs
+./bin/autotune_gemm --sizes 256,512,1024,2048 --csv profiles/autotune_results.csv
+\end{lstlisting}
+
+\subsection{为什么要预热}
+第一次启动可能包含 CUDA context 初始化、模块加载、频率爬升和内存页建立。若直接把第一次 launch 当作 kernel 时间，测到的是启动成本和计算成本的混合。预热只用于让环境进入稳定状态，不应计入正式平均值。
+
+推荐计时结构如下：
+\begin{lstlisting}[style=cuda]
+for (int i = 0; i < warmups; ++i) launch();
+cudaEventRecord(start);
+for (int i = 0; i < repeats; ++i) launch();
+cudaEventRecord(stop);
+cudaEventSynchronize(stop);
+float ms = 0.0f;
+cudaEventElapsedTime(&ms, start, stop);
+float oneLaunchMs = ms / repeats;
+\end{lstlisting}
+
+\subsection{一次实验应记录什么}
+\begin{table}[H]\centering\small
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+项目 & 应记录内容\\\midrule
+输入 & $M,N,K$、数据类型、随机数范围、是否转置\\
+实现 & Git 版本、编译选项、Block/Tile 参数、是否启用 Tensor Core\\
+环境 & GPU 型号、驱动/CUDA、功耗和时钟状态\\
+结果 & 平均时间、重复次数、GFLOPS、最大绝对误差、是否通过\\
+分析 & NCU 的配置、采集 section、报告路径、关键指标和解释\\
+\bottomrule
+\end{tabularx}
+\caption{最小可复现实验记录。}
+\end{table}
+
+\begin{equation}
+  \mathrm{GFLOPS}=\frac{2MNK}{t_{\mathrm{ms}}\times10^6}.
+\end{equation}
+这里的 $2MNK$ 来自每个输出元素的乘加被计为两次浮点操作。不要把 Host 到 Device 拷贝时间混入 kernel-only 的 Event 区间，除非你要分析端到端应用时间。
+
+\pagebreakhere
+\section{Nsight Systems：先看全局时间线}
+\subsection{它适合回答什么}
+Nsight Systems（命令行程序为 \code{nsys}）显示 CPU 线程、CUDA API、kernel、内存拷贝和同步事件的时间关系，适合发现：
+\begin{itemize}
+  \item kernel 是否被频繁 launch，是否存在大量空隙；
+  \item CPU 是否在等待 GPU，或 GPU 是否在等待 CPU；
+  \item H2D/D2H 拷贝是否掩盖了 kernel 优化；
+  \item 多个 stream 是否真正重叠；
+  \item 预热、校验、初始化是否被误计入总时间。
+\end{itemize}
+
+\subsection{项目中的采集命令}
+项目已经提供脚本，默认只采集 CUDA、NVTX 和 OS runtime，关闭需要额外权限的 CPU sampling：
+\begin{lstlisting}[style=shell]
+make profile-v6
+make profile-v7
+./scripts/profile_nsys.sh v4_double_buffer
+\end{lstlisting}
+脚本实际执行的核心命令是：
+\begin{lstlisting}[style=shell]
+nsys profile \\
+  --trace=cuda,nvtx,osrt \\
+  --sample=none --cpuctxsw=none --backtrace=none \\
+  --stats=true --force-overwrite=true \\
+  --output=profiles/nsys/v6_warp_tiling_TIMESTAMP \\
+  ./bin/v6_warp_tiling
+\end{lstlisting}
+报告默认保存到 \code{profiles/nsys/}。命令行查看统计：
+\begin{lstlisting}[style=shell]
+nsys stats profiles/nsys/<report>.nsys-rep
+\end{lstlisting}
+图形界面打开：
+\begin{lstlisting}[style=shell]
+nsys-ui profiles/nsys/<report>.nsys-rep
+\end{lstlisting}
+
+\subsection{图形界面的阅读顺序}
+\begin{enumerate}
+  \item 在 Timeline 中先缩放到一次正式重复区间，确认 kernel 之间没有异常空洞；
+  \item 点击 CUDA GPU Kernel 行，查看 kernel 名、开始时间、持续时间和 stream；
+  \item 对比 CUDA API 行，检查 launch 到 GPU 开始执行的间隔；
+  \item 展开 CUDA Memory 行，确认 memcpy 的方向和大小；
+  \item 使用 Statistics/Summary 按 kernel 汇总，不要只看一次偶然 launch。
+\end{enumerate}
+
+\caution{Systems 的时间线适合定位“哪一段慢”，不提供足够细的 shared-memory bank、寄存器和 Warp Stall 原因。看到 kernel 时间长后，应切换到 Nsight Compute。}
+
+\pagebreakhere
+\section{Nsight Compute：采集一个 kernel 的硬件指标}
+\subsection{独立 V6/V7 程序}
+独立版本通常只需按 kernel 名过滤。V6 的 kernel 名为 \code{gemmWarpTiled}，V7 的 kernel 名为 \code{gemmTensorCore}：
+\begin{lstlisting}[style=shell]
+ncu \\
+  --kernel-name-base function \\
+  --kernel-name gemmWarpTiled \\
+  --launch-count 1 \\
+  --set default \\
+  ./bin/v6_warp_tiling
+
+ncu \\
+  --kernel-name-base function \\
+  --kernel-name gemmTensorCore \\
+  --launch-count 1 \\
+  --set default \\
+  ./bin/v7_tensor_core
+\end{lstlisting}
+如果程序在 kernel 前有 5 次预热并且你无法按名称过滤，可加 \code{--launch-skip 5}；独立版本的实际启动顺序应先用普通运行确认，不要盲目套用 skip 值。
+
+\subsection{参数化 Auto-Tuning kernel}
+Auto-Tuner 支持 profile 模式，只运行一个配置、一个规模，避免 NCU 把整个搜索空间都采集：
+\begin{lstlisting}[style=shell]
+make autotune
+./bin/autotune_gemm --profile bm128_bn128_bk32_tm8_tn8 --size 2048
+\end{lstlisting}
+项目脚本将它包装为完整采集：
+\begin{lstlisting}[style=shell]
+./scripts/profile_ncu.sh bm128_bn128_bk32_tm8_tn8 2048
+./scripts/profile_ncu.sh bm64_bn64_bk16_tm4_tn4 2048
+\end{lstlisting}
+脚本的关键过滤参数是：
+\begin{lstlisting}[style=shell]
+--kernel-name-base function
+--kernel-name regex:gemmTunable
+--launch-skip 5 --launch-count 1
+--export /media/drink_ice/Data/gemm-opt-profiles/ncu/autotune_...
+\end{lstlisting}
+\code{--launch-skip 5 --launch-count 1} 的含义是跳过 5 次预热，只采集第 6 次 kernel。若修改了程序的 warmup 次数，必须同步修改此处。
+
+\subsection{推荐的 section 与报告打开方式}
+\begin{lstlisting}[style=shell]
+ncu \\
+  --kernel-name-base function --kernel-name regex:gemmTunable \\
+  --launch-skip 5 --launch-count 1 \\
+  --section SpeedOfLight \\
+  --section SpeedOfLight_RooflineChart \\
+  --section LaunchStats --section Occupancy \\
+  --section MemoryWorkloadAnalysis \\
+  --section SchedulerStats --section WarpStateStats \\
+  --metrics dram__bytes_read.sum,dram__bytes_write.sum,\\
+  lts__t_bytes.sum,gpu__time_duration.sum \\
+  --export report_name --force-overwrite \\
+  ./bin/autotune_gemm --profile CONFIG --size 2048
+\end{lstlisting}
+命令行导入已有报告：
+\begin{lstlisting}[style=shell]
+.tools/nsight-compute-current/ncu --import <report>.ncu-rep --page details
+.tools/nsight-compute-current/ncu-ui <report>.ncu-rep
+\end{lstlisting}
+
+\caution{NCU 为了采集不同硬件计数器可能 replay 同一个 kernel 多次。NCU duration 用于同一采样条件下的微架构对照；跨工具的绝对时间应优先使用 CUDA Event 或 Systems 时间线。}
+
+\pagebreakhere
+\section{NCU 指标怎么读}
+\subsection{第一层：Launch Statistics 与资源}
+先看启动配置和静态资源，确认你分析的确实是目标 kernel：
+\begin{table}[H]\centering\small
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+指标/页面 & 先回答的问题\\\midrule
+Block size / grid size & 每个 Block 有多少线程？Grid 是否足够填满 GPU？\\
+Registers per thread & 一个线程的寄存器压力是否限制 resident Block？\\
+Static shared memory & 每个 Block 占多少 Shared？是否因容量降低驻留数？\\
+Theoretical Occupancy & 由寄存器、Shared、线程数和架构上限共同决定的上限\\
+Achieved Occupancy & 实际执行期间平均活跃 warp，不等于理论上限\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Occupancy 不是速度指标。大 tile 可能用更多寄存器、拥有更低 Occupancy，但每次加载后复用更多数据、减少 L2 流量和同步开销。真正要问的是：低 Occupancy 是否已经足够隐藏延迟，以及寄存器是否发生 spill。
+
+\subsection{第二层：Speed Of Light 与 Memory Workload}
+\begin{itemize}
+  \item DRAM bytes/read/write 和 DRAM Throughput：判断显存是否接近带宽上限；
+  \item L2 bytes：观察 tile 复用是否减少对更低层缓存的请求；
+  \item L1TEX/shared-memory 相关吞吐：高值不等于 DRAM 饱和；
+  \item SM/Compute Throughput：判断 FP32 CUDA Core 或 Tensor Core 是否接近计算上限。
+\end{itemize}
+对于 FP32 GEMM，理想 FLOP 数是 $2MNK$。如果 NCU 报告的是 kernel duration，可用
+\[
+P_{\mathrm{measured}}=\frac{2MNK}{t_{\mathrm{NCU}}}
+\]
+换算实际 FLOP/s，但注意 NCU 的 replay 和采样会改变绝对时间。
+
+\subsection{第三层：Warp State / Scheduler}
+常见 Stall 原因可按“等待什么”理解：
+\begin{table}[H]\centering\small
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Warp Stall & 典型含义与排查方向\\\midrule
+Long scoreboard & 等待较长延迟的 Global/L2/Shared 依赖；看访存和数据复用\\
+Short scoreboard & 等待较短延迟内存依赖；看加载顺序和依赖链\\
+MIO throttle & MIO/shared/特殊管线发射受限；看 Shared 指令和 bank/事务\\
+LG throttle & Local/Global load-store 管线发射受限；关注寄存器 spill 与 Global load\\
+Math pipe throttle & 算术管线发射受限；检查计算吞吐和指令类型\\
+Barrier & 线程在同步点等待；检查 tile 阶段负载是否不均衡\\
+Not selected & warp 已就绪但调度器本轮选择了别的 warp，不是单独的故障\\
+Wait / No instruction & pipeline 空档或 warp 尚未有可发射指令，需结合 scheduler 看\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\takeaway{Stall 百分比是“没有在本周期发射的原因分布”，不是可以简单相加的时间占比。应先找占比高的原因，再用访存、寄存器和源码映射验证。}
+
+\pagebreakhere
+\section{Roofline：判断带宽受限还是计算受限}
+Roofline 用算术强度 $AI$ 把性能上界分为内存边界和计算边界：
+\begin{equation}
+P\leq\min(P_{\mathrm{peak}}, BW_{\mathrm{peak}}\times AI),
+\qquad AI=\frac{\mathrm{FLOP}}{\mathrm{Byte}}.
+\end{equation}
+两条边界的交点称为 ridge point：
+\[
+AI_{\mathrm{ridge}}=\frac{P_{\mathrm{peak}}}{BW_{\mathrm{peak}}}.
+\]
+
+\subsection{GEMM 的理想强度}
+对 $M=N=K=S$ 的 FP32 GEMM，若只计算从 DRAM 读取一次 A、B 并写一次 C 的理想下界：
+\[
+AI_{\mathrm{ideal}}=\frac{2S^3}{(2S^2+S^2)\times4}
+\approx\frac{S}{6}\ \mathrm{FLOP/Byte}.
+\]
+真实流量还受 tile 重复加载、缓存、边界、写回和 profiler 计数口径影响，所以 NCU 的实际 DRAM AI 应优先使用计数器：
+\[
+AI_{\mathrm{NCU}}=\frac{\texttt{smsp\_inst\_executed\_... 或问题 FLOP}}{\texttt{dram bytes read+write}}.
+\]
+不要用理想值替代实测值，也不要把 L2/shared 字节直接当 DRAM 字节。
+
+\subsection{读 NCU Roofline 图的步骤}
+\begin{enumerate}
+  \item 确认横轴是 Arithmetic Intensity，纵轴是 FLOP/s；
+  \item 找到 memory roof、compute roof 和 ridge point；
+  \item 看 kernel 点在 ridge 左边还是右边；
+  \item 左边优先减少字节数、提高复用、改善合并访问；
+  \item 右边优先提高指令级并行、减少依赖、使用更合适的计算单元；
+  \item 再结合 DRAM/L2/Shared throughput 和 Warp Stall 验证结论。
+\end{enumerate}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\draw[->,thick] (0,0)--(9.2,0) node[right] {AI (FLOP/Byte)};
+\draw[->,thick] (0,0)--(0,6) node[above] {Performance};
+\draw[Blue,very thick] (0,0)--(4.5,3.1);
+\draw[Green!70!black,very thick] (4.5,3.1)--(8.7,3.1);
+\draw[dashed] (4.5,0)--(4.5,3.1);
+\node[align=center] at (2.0,1.4) {Memory-bound\\提高复用/减少流量};
+\node[align=center] at (7.3,4.0) {Compute-bound\\提高计算吞吐/ILP};
+\node[align=center] at (4.5,-0.45) {ridge point};
+\fill[Orange] (7.2,2.7) circle (0.10) node[above right] {kernel};
+\end{tikzpicture}
+\caption{Roofline 的阅读逻辑示意。}
+\end{figure}
+
+\caution{本项目的 2048$^3$ GEMM 实测 DRAM 利用率很低且算术强度位于 ridge point 右侧，因此不能看到“显存带宽不高”就认定优化失败；瓶颈可能在片上 MIO、指令发射、同步或计算管线。}
+
+\pagebreakhere
+\section{把指标对应回 V0--V7 优化}
+\begin{table}[H]\centering\small
+\begin{tabularx}{\linewidth}{lX X}
+\toprule
+版本 & 代码变化 & NCU/Systems 重点观察\\\midrule
+V0 & 每线程直接计算一个 C 元素 & Global load 合并、重复读取、低算术强度\\
+V1 & A/B tile 放入 Shared & DRAM/L2 流量、Shared 事务、Barrier Stall\\
+V2 & 每线程 4×4 寄存器 tile & Registers/thread、Occupancy、spill、MIO\\
+V3 & float4 向量化加载 & Global load 效率、LG throttle、对齐和边界\\
+V4 & 双缓冲组织下一块加载 & Systems 时间线、load/compute 是否重叠\\
+V5 & cp.async 异步 Global→Shared & Async copy、Barrier/Wait、内存流水线\\
+V6 & Warp tile 与 lane 映射 & Warp 责任、Shared bank、寄存器和调度\\
+V7 & WMMA Tensor Core & Tensor Core utilization、输入精度、数值误差\\
+\bottomrule
+\end{tabularx}
+\caption{不要只看 GFLOPS；每一版都要检查它真正引入的机制。}
+\end{table}
+
+\subsection{公平比较 V2/V6 的例子}
+V2 与 V6 都处理 $64\times64\times16$ 的 Block 工作量，但 V2 使用 256 线程、每线程 16 个累加器；V6 使用 128 线程、每线程 32 个累加器。V6 的单线程工作更多，不代表整个 Block 做了更多矩阵乘法。比较时应对齐整个 Block 的 FLOP、输入字节和输出区域。
+
+\begin{table}[H]\centering\small
+\begin{tabular}{lrr}
+\toprule
+同一个 $64\times64\times16$ 工作量 & V2 & V6\\\midrule
+Block 线程数 & 256 & 128\\
+每线程累加器 & 16 & 32\\
+每线程乘加数 & 256 & 512\\
+整个 Block 乘加数 & 65536 & 65536\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{从 NCU 结果到下一次改动}
+\begin{enumerate}
+  \item 如果 DRAM 接近 roof 且 AI 在 ridge 左侧：先做 coalescing、tile 复用、向量化和减少重复搬运；
+  \item 如果 DRAM 很低但 L2/shared/MIO 高：检查片上流量、bank conflict、Shared 访问次数和 tile 形状；
+  \item 如果寄存器高、Occupancy 低但没有 spill：不要自动压寄存器，先看数据复用和 ILP 是否带来收益；
+  \item 如果有 Local load/store 或 spill：缩小 thread tile、减少活跃变量或重新组织循环；
+  \item 如果 Barrier/Scoreboard 高：检查同步粒度、阶段负载均衡和 load/compute 的流水线；
+  \item 如果 Tensor Core 利用率低：检查 WMMA tile、数据布局、对齐、shared-to-fragment 加载和精度模式。
+\end{enumerate}
+
+\pagebreakhere
+\section{常见问题与排错}
+\subsection{NCU 报错或没有结果}
+\begin{description}
+  \item[找不到 section] 用绝对路径指定 section 目录，或检查 NCU 安装版本与目标 GPU/CUDA 是否匹配。不要混用旧版 NCU 的 section 文件。
+  \item[采集到 0 个 kernel] 先直接运行程序确认 kernel 名，再用 \code{--kernel-name-base function}；检查正则是否匹配 C++ 名称。
+  \item[采集到 warmup] 检查程序实际 warmup 次数，重新设置 \code{--launch-skip}；更稳妥的是用 kernel 名和 profile mode 双重过滤。
+  \item[权限/目录错误] 把报告输出到可写目录，例如 \code{/media/drink_ice/Data/gemm-opt-profiles/ncu}；不要让 NCU 把临时 section 写到不可写的 HOME。
+  \item[报告很慢] NCU 可能执行多次 replay。缩小 section、只采集一个 kernel 和一次 launch；性能数字用 Event 重新测。
+\end{description}
+
+\subsection{Systems 与 Compute 的职责混淆}
+\begin{table}[H]\centering\small
+\begin{tabularx}{\linewidth}{lXX}
+\toprule
+现象 & 先用 & 原因\\\midrule
+程序总耗时异常、CPU 空等 & Systems & 需要看 API、线程、拷贝和时间线\\
+一个 kernel 内部访存/计算瓶颈 & Compute & 需要硬件计数器和源代码关联\\
+多个 stream 是否重叠 & Systems & 时间线比单 kernel 计数器更直接\\
+寄存器、Occupancy、Warp Stall & Compute & 属于 kernel 微架构行为\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{一个安全的最小实验流程}
+\begin{lstlisting}[style=shell]
+# 1. 编译并先验证正确性
+make versions autotune
+./bin/v6_warp_tiling
+
+# 2. Systems：确认时间线和 kernel 名
+./scripts/profile_nsys.sh v6_warp_tiling
+nsys stats profiles/nsys/<report>.nsys-rep
+
+# 3. Compute：只采集目标配置的一次正式 launch
+./scripts/profile_ncu.sh bm128_bn128_bk32_tm8_tn8 2048
+
+# 4. 打开报告，按 LaunchStats → Occupancy →
+#    MemoryWorkload → Roofline → WarpState 阅读
+.tools/nsight-compute-current/ncu-ui <report>.ncu-rep
+
+# 5. 修改一个参数后重复相同流程，保留旧报告作对照
+\end{lstlisting}
+
+\section{速查表与参考}
+\subsection{命令速查}
+{\tiny\hfuzz=20pt\setlength{\tabcolsep}{2pt}\begin{tabularx}{\linewidth}{l>{\raggedright\arraybackslash}X}
+\toprule
+目的 & 命令\\\midrule
+编译独立版本 & \code{make versions}\\
+运行版本 & \code{./bin/v6_warp_tiling}\\
+Systems 采集 & \begin{tabular}[t]{@{}l@{}}\code{./scripts/profile_nsys.sh}\\[-0.2em]\code{v6_warp_tiling}\end{tabular}\\
+Systems 统计 & \begin{tabular}[t]{@{}l@{}}\code{nsys stats}\\[-0.2em]\code{<report>.nsys-rep}\end{tabular}\\
+NCU 采集 & \begin{tabular}[t]{@{}l@{}}\code{./scripts/profile_ncu.sh}\\[-0.2em]\code{CONFIG SIZE}\end{tabular}\\
+NCU CLI 打开 & \begin{tabular}[t]{@{}l@{}}\code{ncu --import <report>.ncu-rep}\\[-0.2em]\code{--page details}\end{tabular}\\
+NCU GUI 打开 & \begin{tabular}[t]{@{}l@{}}\code{ncu-ui}\\[-0.2em]\code{<report>.ncu-rep}\end{tabular}\\
+\bottomrule
+\end{tabularx}}
+
+\subsection{推荐阅读}
+\begin{itemize}
+  \item NVIDIA Nsight Systems User Guide：\url{https://docs.nvidia.com/nsight-systems/}
+  \item NVIDIA Nsight Compute Profiling Guide：\url{https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html}
+  \item Nsight Compute CLI：\url{https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html}
+  \item CUDA C++ Best Practices Guide（Occupancy、内存访问）：\url{https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/}
+  \item 项目实验报告：\code{report/GEMM_AutoTuning_NCU_Roofline.pdf}
+  \item 项目 V0--V7 源码讲解：\code{report/GEMM_V0_V7_Optimization_Guide.pdf}
+\end{itemize}
+
+\takeaway{最终的优化结论应写成“现象 → 指标证据 → 源码原因 → 改动 → 复测结果”，而不是只写“Occupancy 提高了所以更快”。}
+
+\end{document}

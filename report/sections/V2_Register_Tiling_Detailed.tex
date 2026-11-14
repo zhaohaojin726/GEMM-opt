@@ -1,0 +1,333 @@
+\section{V2：Register Tiling——4 个 A、4 个 B 更新 16 个结果}
+\subsection{从 V1 到 V2：保留 K 分段，让一个线程负责更多输出}
+V1 每线程只有一个 sum，固定 k 时读 1 个 A、1 个 B，只能做一次乘加。V2 把这个私有累加器扩展为 \code{accum[4][4]}：\textbf{每线程维护 16 个输出，每个 k 用 4 个 A 和 4 个 B 更新全部 16 个结果。}K 分段仍为 BK=16，并没有把点积长度减成 4。
+
+\src{versions/v2_register_tiling.cu}{3--9}
+\lstinputlisting[firstline=3,lastline=9,firstnumber=3]{versions/v2_register_tiling.cu}
+\begin{table}[H]\centering\small
+\begin{tabular}{lll}
+\toprule
+任务层级 & V1 & V2\\\midrule
+线程坐标范围 & 16×16，256 线程 & 16×16，256 线程\\
+每线程输出数量 & 1 & 4×4=16\\
+一个 Block 输出范围 & 16×16 & 64×64\\
+每轮 K 段长度 & 16 & 16\\\bottomrule
+\end{tabular}
+\end{table}
+因此，每轮输入的形状是 $A_{tile}:64\times16$、$B_{tile}:16\times64$，它们贡献给同一个 $C_{tile}:64\times64$。\textbf{BM/BN 是输出范围，BK 是这一轮点积的长度。}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.8cm,y=0.8cm]
+\draw[Blue,fill=PaleBlue] (0,0) rectangle (1.2,4.8);
+\node[lbl] at (0.6,5.3) {A tile};\node[lbl] at (0.6,-0.5) {64×16};
+\node[lbl] at (-0.5,2.4) {64};\node[lbl] at (0.6,2.4) {BK=16};
+\draw[Blue,fill=PaleBlue] (3,1.8) rectangle (7.8,3);
+\node[lbl] at (5.4,3.55) {B tile};\node[lbl] at (5.4,1.3) {16×64};
+\node[lbl] at (5.4,2.4) {BK=16};
+\draw[Green,fill=PaleGreen] (9.6,0) rectangle (14.4,4.8);
+\node[lbl] at (12,5.3) {C tile};\node[lbl] at (12,-0.5) {64×64};
+\node[lbl,text width=4.5cm] at (12,2.4) {4096 个输出累加器\\分布在 256 个线程};
+\node at (2.1,2.4) {$\times$};\node at (8.7,2.4) {$\to$};
+\end{tikzpicture}
+\caption{64×16 乘 16×64，只提供长度为 16 的点积贡献；不是把整个 K 一次读完。}
+\end{figure}
+K=1024 时仍有 64 轮。每个输出每轮累加 16 项，64 轮合计 1024 项。Shared A 的第 17 列是物理 padding，不是参与点积的第 17 个 k。
+\takeaway{V2 改变的是每线程的输出数量与输入复用。线程块尺寸仍是 16×16，输出块却变成 64×64；K 的含义与 V1 完全一致。}
+\pagebreakhere
+
+\subsection{步骤 1：一个线程的 4×4 输出，究竟是哪 16 个元素}
+本节统一选择 \code{blockIdx.x=2}、\code{blockIdx.y=1}，所以输出 Block 的起点是 $r_0=64$、$c_0=128$。选择线程 $(x,y)=(3,2)$，其编号为 $tid=16y+x=35$。
+\[
+r_i=r_0+y+16i,\qquad c_j=c_0+x+16j,\qquad i,j=0,1,2,3.
+\]
+局部输出行是 $2,18,34,50$，局部列是 $3,19,35,51$；加上 Block 起点，\textbf{全局行是 66、82、98、114，列是 131、147、163、179。}
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=0.9cm,y=0.9cm]
+\draw[fill=PaleGreen,draw=Green] (0,0) rectangle (6.4,6.4);
+\foreach \p in {1.6,3.2,4.8} {\draw[gray!50] (\p,0)--(\p,6.4);\draw[gray!50] (0,\p)--(6.4,\p);}
+\foreach \i in {0,1,2,3} {\foreach \j in {0,1,2,3} {
+\pgfmathsetmacro{\xx}{0.3+1.6*\j}\pgfmathsetmacro{\yy}{6.2-1.6*\i}
+\fill[Orange] (\xx-0.07,\yy-0.07) rectangle (\xx+0.07,\yy+0.07);}}
+\node[lbl] at (3.2,7) {64×64 输出，分成 16 个 16×16 子块};
+\node[lbl] at (3.2,-0.6) {同一线程在每个子块的局部 (2,3) 处负责一个输出};
+\node[calcbox,text width=6cm] (acc) at (10.5,4.5) {私有 accum[4][4]\\[0.5em]
+$\begin{matrix}C_{66,131}&C_{66,147}&C_{66,163}&C_{66,179}\\C_{82,131}&C_{82,147}&C_{82,163}&C_{82,179}\\C_{98,131}&C_{98,147}&C_{98,163}&C_{98,179}\\C_{114,131}&C_{114,147}&C_{114,163}&C_{114,179}\end{matrix}$};
+\draw[arrow] (6.4,4.8)--(acc.west);
+\node[lbl,text width=5.3cm] at (10.5,1.5) {矩阵中的下标是全局坐标。\\例如 accum[1][2] 对应 C[82,163]。};
+\end{tikzpicture}
+\caption{4×4 描述的是累加器的逻辑组织，不表示线程拥有连续 4 行×4 列。}
+\end{figure}
+
+\src{versions/v2_register_tiling.cu}{22--26}
+\lstinputlisting[firstline=22,lastline=26,firstnumber=22]{versions/v2_register_tiling.cu}
+\texttt{accum[4][4] = \{\};} 将所有累加元素初始化为 0；它位于 tileK 循环之外，整个 K 归约期间保留。其他线程也在这 16 个子块中取自己的同一局部坐标，恰好覆盖 4096 个输出。
+\takeaway{先记住“谁负责哪些 C”，再看加载。计算责任、协作加载责任和 Shared 的物理布局是三个不同映射。}
+\pagebreakhere
+
+\subsection{步骤 2A：256 个线程怎样搬完 64×16 的 A}
+一个 A tile 有 $64\times16=1024$ 个 float，256 个线程平均各搬 4 个。线程 t 的逻辑 tile 下标为 $t,t+256,t+512,t+768$，再按\textbf{逻辑宽度 BK=16}变成二维行列。
+\src{versions/v2_register_tiling.cu}{28--41}
+\lstinputlisting[firstline=28,lastline=41,firstnumber=28]{versions/v2_register_tiling.cu}
+\begin{enumerate}
+\item 第 28 行：tileK 是当前全局 K 段起点，依次为 0、16、32等。
+\item 第 29--31 行：每个线程间隔 256 处理四个下标，合作覆盖 0--1023。
+\item 第 32--35 行：除以 16 得 tile 行，取模 16 得 tile 列，再加全局起点。
+\item 第 37--40 行：把全局 A 写到对应 Shared 位置，越界补 0。
+\end{enumerate}
+对我们一直看的线程 $t=35$，第 0 个 K 段 tileK=0：
+\begin{table}[H]\centering\small
+\begin{tabular}{rlll}
+\toprule
+index & tileRow / tileCol & Global A & 写入 Shared\\\midrule
+35 & $(2,3)$ & $A[66,3]$ & $tileA[2][3]$\\
+291 & $(18,3)$ & $A[82,3]$ & $tileA[18][3]$\\
+547 & $(34,3)$ & $A[98,3]$ & $tileA[34][3]$\\
+803 & $(50,3)$ & $A[114,3]$ & $tileA[50][3]$\\\bottomrule
+\end{tabular}
+\end{table}
+这条线程搬的是\textbf{同一 K 列 3 上的四个行值}，不是四个连续 float；它只填好 A tile 的四个格子。其他列由其他线程搬入。
+\caution{Shared A 声明为 [64][17]，但 index 对\textbf{有效数据}按 [64][16] 编号，所以这里仍除以/取模 16，不能改成 17。二维数组寻址自动使用 17 列的物理跨度；padding 不需要从 Global 加载。}
+\pagebreakhere
+
+\subsection{步骤 2B：同一组线程怎样搬完 16×64 的 B}
+B 也有 1024 个 float，每线程仍处理相同四个线性下标，但\textbf{逻辑行宽改为 BN=64}，因此二维坐标与 A 不同。
+\src{versions/v2_register_tiling.cu}{43--57}
+\lstinputlisting[firstline=43,lastline=57,firstnumber=43]{versions/v2_register_tiling.cu}
+第 46--49 行除以/取模 64，B 的\textbf{行加 tileK，列加 blockCol}。这与 A 的“行加 blockRow，列加 tileK”互相对应，因为 K 是 A 的列、B 的行。
+
+同样是线程 $t=35$、tileK=0：
+\begin{table}[H]\centering\small
+\begin{tabular}{rlll}
+\toprule
+index & tileRow / tileCol & Global B & 写入 Shared\\\midrule
+35 & $(0,35)$ & $B[0,163]$ & $tileB[0][35]$\\
+291 & $(4,35)$ & $B[4,163]$ & $tileB[4][35]$\\
+547 & $(8,35)$ & $B[8,163]$ & $tileB[8][35]$\\
+803 & $(12,35)$ & $B[12,163]$ & $tileB[12][35]$\\\bottomrule
+\end{tabular}
+\end{table}
+\textbf{这一轮该线程搬 4 个 A、4 个 B，共 8 个 float。}A 来自四个行、同一个 K 列；B 来自同一列、四个 K 行。它搬的 B 不是计算某个 k 时所需的四个输出列。
+
+\textbf{为什么不会漏数据？}任意逻辑 index 都能唯一拆成 $index=t+256u$，其中 $t=index\bmod256$、$u=\lfloor index/256\rfloor$。线程 t 在第 u 次循环处理它。因此 1024 个下标被分给 256 线程×4 次，没有遗漏或重复。
+
+第 57 行 \code{__syncthreads()} 等所有 A/B 写入完成。之后才允许跨线程读取；不是“我自己的八个数到了，就能直接开始算全部 16 个输出”。
+\takeaway{Global 搬运是全 Block 合作：A/B 各 1024 float 分给 256 个线程。进入计算时，小块已经完整，共享数据不再属于某个生产线程。}
+\pagebreakhere
+
+\subsection{步骤 3：固定 k，从 Shared 收集四行 A、四列 B}
+现在取第一个 K 段中的 k=6。线程 $(3,2)$ 从自己的四条输出行收集 A，从自己的四条输出列收集 B；这一刻所有输入共用同一 K 下标 q=6。
+\src{versions/v2_register_tiling.cu}{59--72}
+\lstinputlisting[firstline=59,lastline=72,firstnumber=59]{versions/v2_register_tiling.cu}
+\begin{table}[H]\centering\small
+\begin{tabular}{llll}
+\toprule
+寄存器位置 & 读取的 Shared & 对应 Global 值 & 搬入它的线程 $(x,y)$\\\midrule
+regA[0] & $tileA[2][6]$ & $A[66,6]$ & $(6,2)$\\
+regA[1] & $tileA[18][6]$ & $A[82,6]$ & $(6,2)$\\
+regA[2] & $tileA[34][6]$ & $A[98,6]$ & $(6,2)$\\
+regA[3] & $tileA[50][6]$ & $A[114,6]$ & $(6,2)$\\\midrule
+regB[0] & $tileB[6][3]$ & $B[6,131]$ & $(3,8)$\\
+regB[1] & $tileB[6][19]$ & $B[6,147]$ & $(3,9)$\\
+regB[2] & $tileB[6][35]$ & $B[6,163]$ & $(3,10)$\\
+regB[3] & $tileB[6][51]$ & $B[6,179]$ & $(3,11)$\\\bottomrule
+\end{tabular}
+\caption{所有坐标按真实 V2 地址公式推导。例如 B[6,163] 的 tile index 为 6×64+35=419，由 tid=419 mod 256=163，即线程 (3,10) 搬入。}
+\end{table}
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=7mm]
+\node[box,text width=3.9cm] (a) {Shared A 的四条输出行\\都取 k=6 的元素};
+\node[calcbox,right=of a,text width=3.6cm] (ra) {regA[0..3]：四个 A};
+\node[box,below=of a,text width=3.9cm] (b) {Shared B 的四条输出列\\都取 k=6 的元素};
+\node[calcbox,right=of b,text width=3.6cm] (rb) {regB[0..3]：四个 B};
+\node[lbl,text width=3.6cm,right=of ra,yshift=-0.65cm] {这八个值来自完整的 Shared\\不是重新从 Global 搬八个值};
+\draw[arrow] (a)--(ra);\draw[arrow] (b)--(rb);
+\end{tikzpicture}
+\caption{计算输入先收集到私有临时值中，再进行外积复用。}
+\end{figure}
+\takeaway{每个 k 的 4+4 是四个输出行值、四个输出列值；它们通常由别的线程加载。它不是每 K tile 的那组 Global 搬运数据。}
+\pagebreakhere
+
+\input{report/sections/V2_Read_Grid.tex}
+\subsection{步骤 4：8 个寄存器输入交叉配对，更新 16 个 accum}
+\src{versions/v2_register_tiling.cu}{74--81}
+\lstinputlisting[firstline=74,lastline=81,firstnumber=74]{versions/v2_register_tiling.cu}
+i 循环选择四条输出行中的一条，j 循环选择四条输出列中的一条。\textbf{每个 i 都遍历四个 j}，所以不是只做 \code{regA[i]*regB[i]} 四对，而是做 4×4=16 对。
+
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1.2cm,y=1cm]
+\foreach \j in {0,1,2,3} {\node[box,minimum width=1cm,minimum height=0.65cm] at (\j+1,1) {$b_{\j}$};}
+\foreach \i in {0,1,2,3} {
+\node[box,minimum width=1cm,minimum height=0.65cm] at (0,-\i) {$a_{\i}$};
+\foreach \j in {0,1,2,3} {\node[calcbox,minimum width=1cm,minimum height=0.65cm] at (\j+1,-\i) {$+a_{\i}b_{\j}$};}}
+\node[lbl,text width=5.3cm] at (7,-0.8) {$a_i=regA[i]$，$b_j=regB[j]$\\[0.4em]每个绿格更新自己的 accum[i][j]\\四个 A 各复用 4 次\\四个 B 各复用 4 次};
+\node[lbl] at (2.5,-4.05) {一个 k：8 个输入 → 16 次乘加};
+\end{tikzpicture}
+\caption{同一线程内的寄存器外积；16 个结果属于该线程，不需要 atomic 或跨线程归约。}
+\end{figure}
+
+假设某个 k 读出 $regA=[1,2,3,4]$、$regB=[10,20,30,40]$（仅作数值示意，并非实际 benchmark 输入），这一项贡献就是
+\[
+\Delta accum^{(k)}=\begin{bmatrix}1\\2\\3\\4\end{bmatrix}
+\begin{bmatrix}10&20&30&40\end{bmatrix}
+=\begin{bmatrix}10&20&30&40\\20&40&60&80\\30&60&90&120\\40&80&120&160\end{bmatrix}.
+\]
+例如 $accum[1][2]$ 增加 $2\times30=60$，同时 $accum[1][0]$ 增加 $2\times10=20$。同一个 A 值 2 没有为四个输出重新读取四次，它在寄存器中被重复使用。
+\takeaway{外积的收益不是少算乘法，而是把已经取到的输入多用几次。16 个输出各获得当前 k 的一项贡献。}
+\pagebreakhere
+
+\subsection{步骤 5：k 从 0 到 15，保证每个输出完成 16 项点积}
+刚才的外积只完成\textbf{一个 k}。第 60 行的 k 循环把同样步骤重复 16 次：每次换一组 regA/regB，\textbf{累加器不换、不清零}。
+\begin{figure}[H]\centering
+\begin{tikzpicture}[node distance=6mm]
+\node[box,text width=2.6cm] (k0) {k=0\\取四个 A / 四个 B};
+\node[box,right=of k0,text width=2.6cm] (k1) {k=1\\换下一组 A / B};
+\node[box,right=of k1,text width=1.1cm] (mid) {$\cdots$};
+\node[box,right=of mid,text width=2.6cm] (k15) {k=15\\取最后一组 A / B};
+\node[calcbox,below=11mm of k1,xshift=1.1cm,text width=8cm] (acc) {同一套 accum[4][4]\\每步给全部 16 个输出各加一项，合计每输出 16 项};
+\draw[arrow] (k0)--(k1);\draw[arrow] (k1)--(mid);\draw[arrow] (mid)--(k15);
+\draw[thinarr] (k0.south)--(acc.north west);\draw[thinarr] (k1.south)--(acc.north);
+\draw[thinarr] (k15.south)--(acc.north east);
+\end{tikzpicture}
+\caption{regA/regB 表达当前 k 的输入；accum 表达跨 k 保留的输出部分和。源码作用域不同，生命周期也不同。}
+\end{figure}
+
+继续取具体的 $accum[1][2]$，它对应 $C[82,163]$。第一轮 tileK=0 的计算是
+\begin{align*}
+accum[1][2]\mathrel{+}={}&A[82,0]B[0,163]+A[82,1]B[1,163]+\cdots\\
+&+A[82,6]B[6,163]+\cdots+A[82,15]B[15,163].
+\end{align*}
+\textbf{仍用到 A 这一行的 16 个元素和 B 这一列的 16 个元素。}其他 15 个 accum 也分别得到完整的 16 项贡献，只是它们与这个输出共享四条 A 行、四条 B 列。
+
+从矩阵形状看，把该线程本轮需要的数据整理为两个数学片段：
+\begin{align*}
+A_{thread}[i,k]&=A[r_i',\,\mathrm{tileK}+k],\qquad A_{thread}\text{ 的形状为 }4\times16;\\
+B_{thread}[k,j]&=B[\mathrm{tileK}+k,\,c_j'],\qquad B_{thread}\text{ 的形状为 }16\times4.
+\end{align*}
+则单线程的本轮工作是 $\Delta accum_{4\times4}=A_{thread}B_{thread}$。
+这里 $r_i'$ 和 $c_j'$ 指线程的四条全局输出行/列，集合不是连续行列。代码没有一次读出这两个完整片段，而是按 k 每次取其中一列 A、一行 B。
+
+\caution{“4 个 A、4 个 B”是空间上的行列数量；“16 个 k”是时间上的点积步数。把两者混在一起，才会误以为某个输出少算了 12 项。}
+\takeaway{一次 k：16 次乘加，给 16 个输出各贡献一项。一轮 BK=16：16×16=256 次乘加，给每个输出贡献 16 项。}
+\pagebreakhere
+
+\subsection{步骤 6--7：推进下一 K 段，再把 16 个结果写到正确坐标}
+若 K=32，tileK=0 和 tileK=16 各做一次上述 16 步。线程 $(3,2)$ 的输出坐标仍是行 66/82/98/114、列 131/147/163/179；变的是 A 的列和 B 的行：
+\begin{table}[H]\centering\small
+\begin{tabular}{rll}
+\toprule
+tileK & 本轮该线程协作搬入的 A & 本轮协作搬入的 B\\\midrule
+0 & 行 66/82/98/114，列 3 & 行 0/4/8/12，列 163\\
+16 & 行 66/82/98/114，列 19 & 行 16/20/24/28，列 163\\\bottomrule
+\end{tabular}
+\end{table}
+计算时则遍历本轮全部 k。以 $accum[1][2]$ 为例，第二轮继续加 $\sum_{q=16}^{31}A[82,q]B[q,163]$；和第一轮相加就得到完整的 32 项点积。
+
+\textbf{Shared 只保存当前输入段，accum 保存所有已计算段的和。}第 57 行 barrier 保护“加载后再读取”，第 83 行保护“所有线程读完后再覆盖”。两次同步与 V1 同理，V2 仍是单缓冲，没有加载下一块与计算当前块的显式流水线。
+
+\src{versions/v2_register_tiling.cu}{86--97}
+\lstinputlisting[firstline=86,lastline=97,firstnumber=86]{versions/v2_register_tiling.cu}
+写回使用与计算完全一致的 $r_i=r_0+y+16i$、$c_j=c_0+x+16j$。例如 i=1、j=2 时将 accum[1][2] 写到 $C[82,163]$，不是写到 $C[67,133]$ 这种连续线程块坐标。
+
+\textbf{为什么没有线程重复写同一输出？}任意局部输出坐标 $(R,S)$（0--63）可唯一分解为 $y=R\bmod16$、$i=\lfloor R/16\rfloor$，$x=S\bmod16$、$j=\lfloor S/16\rfloor$。因此恰有一个线程/累加器负责它。
+
+\textbf{网格也要按输出 tile 计算：}横向 $\lceil N/64\rceil$、纵向 $\lceil M/64\rceil$；不能因为 blockDim 是 16×16，就仍除以 16。边缘输入补 0，所有线程仍参与 barrier，最后按 row<M、col<N 筛选有效写回。
+\takeaway{加载的步长是 tileK+=16，Block 的输出步长是 64，线程的输出间隔是 16。三个“步长”作用不同，不能互换。}
+\pagebreakhere
+
+\subsection{完整数值例子：三次外积，得到四个完整点积}
+为写出所有数字，本页把\textbf{单线程示意}缩成 TM=TN=2、BK=3；真实 V2 仍是 TM=TN=4、BK=16。这个例子说明计算组织，不是改动 kernel 参数后的测试。
+\[
+A_* = \begin{bmatrix}1&2&3\\4&5&6\end{bmatrix},\qquad
+B_* = \begin{bmatrix}7&8\\9&10\\11&12\end{bmatrix}.
+\]
+accum[2][2] 初始为 0，按 k 逐步取输入并交叉配对：
+\begin{align*}
+k=0:\quad \Delta C_0&=\begin{bmatrix}1\\4\end{bmatrix}\begin{bmatrix}7&8\end{bmatrix}
+=\begin{bmatrix}7&8\\28&32\end{bmatrix},\\[0.3em]
+k=1:\quad \Delta C_1&=\begin{bmatrix}2\\5\end{bmatrix}\begin{bmatrix}9&10\end{bmatrix}
+=\begin{bmatrix}18&20\\45&50\end{bmatrix},\\[0.3em]
+k=2:\quad \Delta C_2&=\begin{bmatrix}3\\6\end{bmatrix}\begin{bmatrix}11&12\end{bmatrix}
+=\begin{bmatrix}33&36\\66&72\end{bmatrix}.
+\end{align*}
+\begin{table}[H]\centering
+\begin{tabular}{rllll}
+\toprule
+处理完 k & accum[0][0] & accum[0][1] & accum[1][0] & accum[1][1]\\\midrule
+0 & 7 & 8 & 28 & 32\\
+1 & 25 & 28 & 73 & 82\\
+2 & 58 & 64 & 139 & 154\\\bottomrule
+\end{tabular}
+\caption{表中是累计结果，不是单次外积贡献。每个累加器在每一个 k 都被更新一次。}
+\end{table}
+最终 $C_* = \begin{bmatrix}58&64\\139&154\end{bmatrix}$。逐输出核对：
+\begin{align*}
+C_{00}&=1\times7+2\times9+3\times11=58;\\
+C_{01}&=1\times8+2\times10+3\times12=64;\\
+C_{10}&=4\times7+5\times9+6\times11=139;\\
+C_{11}&=4\times8+5\times10+6\times12=154.
+\end{align*}
+\textbf{四个点积一个也没少算。}例如 A 的数值 1 在 k=0 的同一时刻供 C00/C01 两个输出使用；B 的数值 7 供 C00/C10 使用。真实 4×4 情况只是把各输入的寄存器内复用从 2 次变为 4 次。
+\takeaway{矩阵乘法既可按“每个输出做完整点积”组织，也可按“每个 k 做一次外积并累加”组织。V2 选择后者，便于同一线程复用输入。}
+\pagebreakhere
+
+\subsection{工作量与收益：按同一块 64×64 输出比较 V1/V2}
+下表统一计算\textbf{同一块 64×64 输出的一个完整 BK=16 段}，无边界填充。V1 需 16 个 16×16 Block，V2 需一个 64×64 Block；源码逻辑读取不等同于硬件事务。
+\begin{table}[H]\centering\small
+\begin{tabular}{lrr}
+\toprule
+同一输出区域、同一 K 段 & V1 & V2\\\midrule
+需要的 Block 数 & 16 & 1\\
+每线程累加器 & 1 & 16\\
+每线程每 k Shared 输入 & 1A+1B & 4A+4B\\
+每线程每 k 乘加 & 1 & 16\\
+每线程每 K tile Global 输入 float & 2 & 8\\
+该区域 Global 逻辑输入 float & 8192 & 2048\\
+该区域 Shared 逻辑读取 float & 131072 & 32768\\
+该区域乘加次数 & 65536 & 65536\\
+单个 Block 静态 Shared & 2 KiB & 8.25 KiB\\\bottomrule
+\end{tabular}
+\end{table}
+\textbf{Block 复用：}64×64 输出使 A 的每个 tile 元素供 64 列使用，B 的每个元素供 64 行使用。相对 V1，同一区域理想输入请求量降为四分之一。
+
+\textbf{寄存器复用：}V1 每次乘加需要两个 Shared 标量读取；V2 八个 Shared 输入供 16 次乘加，平均每乘加 0.5 次读取，逻辑读取也降为四分之一。广播和编译优化会改变真正的 Shared 事务数，但不改变这个源码复用解释。
+\[
+I_{V2,\mathrm{tile}}=\frac{2\times64\times64\times16}{4(64\times16+16\times64)}
+=16\ \mathrm{FLOP/B}.
+\]
+该模型只算理想 tile 输入，V1 为 4 FLOP/B；不能据此声称实测 DRAM 带宽效率或速度提高四倍。缓存、同步、指令、寄存器与驻留情况都影响最终时间。
+
+\textbf{单线程计数：}每 K tile 从 Global 搬 4A+4B，从 Shared 读 $16(4+4)=128$ 个 float，做 $16\times16=256$ 次乘加。K=1024 时做 16384 次乘加，得到\textbf{16 个各含 1024 项的输出}。
+\takeaway{V2 没少算乘法，而是用更少的输入请求/指令机会支撑相同输出工作量。单线程工作更多，是因为它承担了 16 倍输出。}
+\pagebreakhere
+
+\subsection{padding 与寄存器代价：不要把布局优化当成固定口诀}
+\src{versions/v2_register_tiling.cu}{19--20、59--78}
+Shared A 是 [64][17]，B 是 [16][64]。对 float 标量可用 $bank=(\mathrm{wordAddress})\bmod32$ 分析：不同地址落同 bank 会冲突，相同地址可广播\cite{best}。必须分析\textbf{同一个 Warp、同一次指令}，不能把不同时刻的地址混算。
+
+V2 的 16×16 线程块按 x 优先编号，一个 Warp 覆盖两个 y 行、每行 16 个 x。固定 i=0、k=6 读取 regA 时，Warp 0 的前 16 lanes 都读 A 行 0、后 16 lanes 都读 A 行 1。下图以 A 基址落在 bank 0 为例；统一平移 bank 编号不改变是否冲突。
+\begin{figure}[H]\centering
+\begin{tikzpicture}[x=1cm,y=0.9cm]
+\node[lbl] at (2,2.4) {同一次 regA[0] Shared 读取};
+\node[lbl] at (6.7,2.4) {A 行跨度 16};\node[lbl] at (10.5,2.4) {A 行跨度 17};
+\node[box,text width=3.8cm] (r0) at (2,1) {lane 0--15\\同读 tileA[0][6]};
+\node[box,text width=3.8cm] (r1) at (2,-0.5) {lane 16--31\\同读 tileA[1][6]};
+\node[calcbox,text width=2cm] (s0) at (6.7,1) {bank 6};
+\node[calcbox,text width=2cm] (s1) at (6.7,-0.5) {bank 22};
+\node[calcbox,text width=2cm] at (10.5,1) {bank 6};
+\node[calcbox,text width=2cm] at (10.5,-0.5) {bank 23};
+\draw[arrow] (r0)--(s0);\draw[arrow] (r1)--(s1);
+\node[lbl,text width=10cm] at (7,-2.2) {两种布局在这一次读取中都只有两种地址，并落不同 bank；\\每种地址的 16 个请求可以广播。};
+\end{tikzpicture}
+\caption{+1 并不是修复 V2 这类读取的必需条件。V6 有四种连续行地址，其映射不同，详见 V6 的 padding 图。}
+\end{figure}
+
+B 计算时固定 k、j，x=0--15 给出 16 个相邻列，两个 y 组重复同样地址：不同列落不同 bank，重复同址可广播。不同 j 的列组是在不同读取步骤中使用，不能只因它们跨 16/32 列就合并判为一次冲突。
+
+\textbf{因此：}源码采用 A+1/B 不补的布局，但不能只看声明就保证所有加载、存储和计算都更快。经典 32×32 列读取中 stride=32/33 的结论，不能机械套到本版本的 Warp 映射。若研究 padding 收益，应分别算各阶段地址，保持其余条件一致做对照，并用 NCU 检查 bank/事务变化。
+
+\textbf{寄存器代价：}accum 逻辑上有 16 个 float，即 64 字节/线程；regA/regB 各四个值，加上地址和循环临时量，会增加真实寄存器需求。不能据此认定 kernel 恰好使用 24 个寄存器；编译器展开、生存期、spill 和分配粒度都要看编译输出。
+
+\textbf{其他限制：}Shared 增大可能减少同驻 Block；Block tile 增大使小矩阵的可调度 Block 变少；unroll 可以减少循环控制，但也可能扩大代码和活跃临时量。优化目标是总时间，不是让 tile、寄存器数或 Occupancy 单独最大化。
+\takeaway{V2 已完成两级输入复用，尚未使用向量化 Global 加载、双缓冲、cp.async 或 Tensor Core。下一步 V3 主要改变加载指令与分工，不改变这里的 4×4 计算责任。}
+\pagebreakhere

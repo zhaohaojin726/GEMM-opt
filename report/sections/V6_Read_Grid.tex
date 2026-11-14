@@ -1,0 +1,17 @@
+\subsection{网格图：一个 lane 的八条 A 行、四条 B 列}
+继续看 Warp 0 的 lane 11：laneRow=1、laneCol=3。为放大格子，下图只展示 Warp 0 对应的 A 前 32 行、B 前 32 列以及 C 的左上 32×32 区域；\textbf{它们仍来自全 Block 的 Shared tile，并非 Warp 私有数组。}
+\begin{figure}[H]\centering
+\input{report/figures/V6_Shared_Read_Grid.tikz}
+\caption{与 V1/V2 相同，A 沿行遍历 k、B 沿列遍历 k。区别是 lane 11 同时负责八行与四列的 32 个交叉输出，而不是一块连续的 8×4 区域。网格每格一个元素，横纵缩放随各自维度变化。}
+\end{figure}
+这个 lane 在每个 k 执行
+\[
+accum[i][j]\mathrel{+}=tileA[1+4i][k],tileB[k][3+8j],\quad i=0\ldots7,\ j=0\ldots3.
+\]
+例如 $accum[2][2]$ 对应本地 $C[9,19]$。k=6 时加 $tileA[9][6]\times tileB[6][19]$；本轮完整贡献为
+\[
+\Delta C[9,19]=\sum_{k=0}^{15}tileA[9][k],tileB[k][19].
+\]
+若 Block 起点仍取 $(64,128)$，这个输出就是全局 $C[73,147]$。剩余 31 个橙色输出同样各完成 16 项点积，其他格子由 Warp 0 的其他 lane 负责。
+\takeaway{V2 每 k 用 4A+4B 更新 16 个输出；V6 每 k 用 8A+4B 更新 32 个输出。K 循环仍是 16 步，没有少算点积，也不是一次读出整行整列。}
+\pagebreakhere
